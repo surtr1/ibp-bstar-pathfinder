@@ -1,34 +1,41 @@
-# 目前需要修改的
-
-
+# Operating system files
 .DS_Store
 Thumbs.db
 
-# IDE / 编辑器
+# IDE / editor settings
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# 日志与临时文件
+# Logs and temporary files
 *.log
 tmp/
 temp/
 
-# 环境变量
+# Environment files
 .env
 .env.local
 
-# 依赖目录
-node_modules/
+# Python
 venv/
 __pycache__/
 *.egg-info/
 
-# 编译输出
-dist/
+# Frontend / package manager
+node_modules/
+
+# CMake / build outputs
 build/
+cmake-build-*/
+dist/
 out/
+bin/
 *.o
-*.class
+*.obj
+*.pdb
+*.ilk
 *.exe
+
+# Generated demo output
+output/

@@ -1,0 +1,825 @@
+﻿#include "pathfinding_algorithms.hpp"
+
+#include "ibp_bstar_core.hpp"
+#include "pathfinding_grid.hpp"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <queue>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace pathfinding
+{
+	namespace
+	{
+		// 统一使用高精度时钟进行简单 benchmark 计时。
+		using TimerClock = std::chrono::high_resolution_clock;
+
+		enum class BranchMode : std::uint8_t
+		{
+			Direct = 0,
+			FollowObstacle = 1
+		};
+
+		struct BranchStateNode
+		{
+			int			 cell_linear_index = -1;
+			std::uint8_t mode_index = 0;
+			std::uint8_t direction_index = 4;
+		};
+
+		constexpr std::array<Position, 4> kFourNeighborOffsets = { Position { -1, 0 }, Position { 1, 0 }, Position { 0, -1 }, Position { 0, 1 } };
+
+		// 把二维坐标映射到一维数组下标，方便连续存储访问状态。
+		int ToLinearIndex( int row, int col, int grid_width )
+		{
+			return row * grid_width + col;
+		}
+
+		// 把一维数组下标恢复成网格坐标。
+		Position FromLinearIndex( int linear_index, int grid_width )
+		{
+			return { linear_index / grid_width, linear_index % grid_width };
+		}
+
+		// 计算两个格子的 Manhattan 距离。
+		// 在四连通栅格上，这是 A* 常用的启发式。
+		int ManhattanDistance( Position lhs, Position rhs )
+		{
+			return std::abs( lhs.row - rhs.row ) + std::abs( lhs.col - rhs.col );
+		}
+
+		// 统一检查一次搜索请求是否合法。
+		// 这样各个算法入口都能共享同一套输入校验逻辑。
+		bool IsSearchRequestValid( const Grid& grid, Position start, Position goal )
+		{
+			return IsGridShapeValid( grid ) && IsInsideGrid( grid, start ) && IsInsideGrid( grid, goal ) && IsPassable( grid, start.row, start.col ) && IsPassable( grid, goal.row, goal.col );
+		}
+
+		// 根据 parent 数组从终点反向重建格子路径。
+		// BFS、A*、Dijkstra 这类基于 parent 链的算法都会复用它。
+		std::vector<Position> ReconstructCellPath( int goal_linear_index, const std::vector<int>& parent_by_index, int grid_width )
+		{
+			std::vector<Position> path;
+			for ( int trace_index = goal_linear_index; trace_index != -1; trace_index = parent_by_index[ trace_index ] )
+			{
+				path.push_back( FromLinearIndex( trace_index, grid_width ) );
+			}
+			std::reverse( path.begin(), path.end() );
+			return path;
+		}
+
+		// 把“重建路径 + 写回结果统计 + 做路径合法性校验”这几个收尾动作集中到一起。
+		// 这样可以避免不同算法各自重复一遍同样的收尾代码。
+		void FinalizeSuccessfulCellResult( SearchResult& result, const Grid& grid, const std::vector<int>& parent_by_index, int goal_linear_index, int grid_width )
+		{
+			result.path = ReconstructCellPath( goal_linear_index, parent_by_index, grid_width );
+			result.meet_position = result.path.empty() ? Position { -1, -1 } : result.path.back();
+			result.statistics.final_path_length = static_cast<int>( result.path.size() );
+			result.success = ValidatePathContiguity( grid, result.path );
+		}
+
+		// 把命令行里的算法名 token 归一化，便于兼容大小写和空白差异。
+		std::string NormalizeToken( std::string token )
+		{
+			token.erase( std::remove_if( token.begin(), token.end(), []( unsigned char ch ) { return std::isspace( ch ); } ), token.end() );
+			std::transform( token.begin(), token.end(), token.begin(), []( unsigned char ch ) { return static_cast<char>( std::tolower( ch ) ); } );
+			return token;
+		}
+
+		// 统一测量算法耗时，并保证返回值至少为 1 微秒。
+		// 这样在 Windows 上也不会因为计时粒度问题把很快的算法显示成 0。
+		long long MeasureElapsedMicroseconds( TimerClock::time_point started_at )
+		{
+			const long long elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>( TimerClock::now() - started_at ).count();
+			if ( elapsed_nanoseconds <= 0 )
+			{
+				return 1;
+			}
+			return std::max<long long>( 1, ( elapsed_nanoseconds + 999 ) / 1000 );
+		}
+
+		// 把方向字符压成小整数，便于状态编码。
+		int DirectionToIndex( char direction_char )
+		{
+			switch ( direction_char )
+			{
+			case 'U': return 0;
+			case 'D': return 1;
+			case 'L': return 2;
+			case 'R': return 3;
+			default: return 4;
+			}
+		}
+
+		// 把方向下标恢复成方向字符。
+		char IndexToDirection( int direction_index )
+		{
+			switch ( direction_index )
+			{
+			case 0: return 'U';
+			case 1: return 'D';
+			case 2: return 'L';
+			case 3: return 'R';
+			default: return 0;
+			}
+		}
+
+		// 根据方向字符返回对应的行列位移。
+		std::pair<int, int> DirectionDelta( char direction_char )
+		{
+			switch ( direction_char )
+			{
+			case 'U': return { -1, 0 };
+			case 'D': return { 1, 0 };
+			case 'L': return { 0, -1 };
+			case 'R': return { 0, 1 };
+			default: return { 0, 0 };
+			}
+		}
+
+		// 返回某个方向的反方向。
+		char OppositeDirection( char direction_char )
+		{
+			switch ( direction_char )
+			{
+			case 'U': return 'D';
+			case 'D': return 'U';
+			case 'L': return 'R';
+			case 'R': return 'L';
+			default: return 0;
+			}
+		}
+
+		// 返回某个方向对应的“左转 / 右转”方向。
+		std::pair<char, char> LeftRightDirections( char direction_char )
+		{
+			switch ( direction_char )
+			{
+			case 'U': return { 'L', 'R' };
+			case 'D': return { 'R', 'L' };
+			case 'L': return { 'D', 'U' };
+			case 'R': return { 'U', 'D' };
+			default: return { 0, 0 };
+			}
+		}
+
+		// 根据当前位置和目标位置给出一个“更偏向目标”的贪心方向。
+		// Branch Star 直行阶段会依赖这个方向选择。
+		char ChooseGreedyDirection( int current_row, int current_col, int goal_row, int goal_col )
+		{
+			const int delta_row = goal_row - current_row;
+			const int delta_col = goal_col - current_col;
+			if ( delta_row == 0 && delta_col == 0 )
+			{
+				return 0;
+			}
+			if ( std::abs( delta_row ) >= std::abs( delta_col ) )
+			{
+				return delta_row > 0 ? 'D' : 'U';
+			}
+			return delta_col > 0 ? 'R' : 'L';
+		}
+
+		// 把 Branch Star 的状态编码成一维整数。
+		// 这里状态只保留：位置、模式、当前绕障方向，尽量贴近 Python 版的轻量实现。
+		int EncodeBranchStateId( int cell_linear_index, std::uint8_t mode_index, std::uint8_t direction_index )
+		{
+			constexpr int kModeCount = 2;
+			constexpr int kDirectionCount = 5;
+			return ( cell_linear_index * kModeCount + static_cast<int>( mode_index ) ) * kDirectionCount + static_cast<int>( direction_index );
+		}
+
+		// 与 EncodeBranchStateId 配套，用于把压缩状态恢复成可读结构。
+		BranchStateNode DecodeBranchStateId( int state_id )
+		{
+			constexpr int kDirectionCount = 5;
+			constexpr int kModeCount = 2;
+
+			BranchStateNode node;
+			node.direction_index = static_cast<std::uint8_t>( state_id % kDirectionCount );
+			state_id /= kDirectionCount;
+			node.mode_index = static_cast<std::uint8_t>( state_id % kModeCount );
+			state_id /= kModeCount;
+			node.cell_linear_index = state_id;
+			return node;
+		}
+
+		// 当直行被障碍挡住时，生成左右两个绕障分支。
+		// 如果允许回退，则把反方向作为一个更弱的候选。
+		std::array<char, 3> BuildInitialBranchDirections( char blocked_direction, bool allow_reverse_when_crawling )
+		{
+			std::array<char, 3> ordered_directions { 0, 0, 0 };
+			const auto [ left_direction, right_direction ] = LeftRightDirections( blocked_direction );
+			ordered_directions[ 0 ] = left_direction;
+			ordered_directions[ 1 ] = right_direction;
+			ordered_directions[ 2 ] = allow_reverse_when_crawling ? OppositeDirection( blocked_direction ) : 0;
+			return ordered_directions;
+		}
+
+		// 在绕障过程中，如果当前绕障方向走不通，则尝试左右转向。
+		// 这个规则比此前的高维状态模型简单很多，更接近 Python 默认版 B* 的“轻量分支绕障”。
+		std::array<char, 3> BuildFollowDirections( char current_direction, bool allow_reverse_when_crawling )
+		{
+			std::array<char, 3> ordered_directions { 0, 0, 0 };
+			const auto [ left_direction, right_direction ] = LeftRightDirections( current_direction );
+			ordered_directions[ 0 ] = left_direction;
+			ordered_directions[ 1 ] = right_direction;
+			ordered_directions[ 2 ] = allow_reverse_when_crawling ? OppositeDirection( current_direction ) : 0;
+			return ordered_directions;
+		}
+
+		// 返回四个正交方向。
+		// 当局部分支完全走死时，可以把它们作为兜底扩展方向。
+		std::array<char, 4> BuildAllDirections()
+		{
+			return { 'U', 'D', 'L', 'R' };
+		}
+
+		// 生成一个仅包含算法名的空结果对象。
+		// 当输入非法或算法提前失败时，可以直接返回这个基础结果。
+		SearchResult MakeEmptyResult( AlgorithmId algorithm_id )
+		{
+			SearchResult result;
+			result.algorithm_name = GetAlgorithmName( algorithm_id );
+			return result;
+		}
+
+		template <typename HeuristicFn>
+		SearchResult RunBestFirstSearch( AlgorithmId algorithm_id, const Grid& grid, Position start, Position goal, HeuristicFn heuristic )
+		{
+			// A* 和 Dijkstra 都可以抽象成“基于优先队列的最佳优先图搜索”，
+			// 区别只在于启发式项是否为 0。
+			SearchResult result = MakeEmptyResult( algorithm_id );
+			const auto	started_at = TimerClock::now();
+			if ( !IsSearchRequestValid( grid, start, goal ) )
+			{
+				result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+				return result;
+			}
+
+			const int grid_height = static_cast<int>( grid.size() );
+			const int grid_width = static_cast<int>( grid.front().size() );
+			const int total_cells = grid_height * grid_width;
+			const int start_linear_index = ToLinearIndex( start.row, start.col, grid_width );
+			const int goal_linear_index = ToLinearIndex( goal.row, goal.col, grid_width );
+
+			struct OpenNode
+			{
+				int linear_index = -1;
+				int g_cost = 0;
+				int f_cost = 0;
+				int h_cost = 0;
+			};
+
+			struct OpenNodeGreater
+			{
+				// 定义优先队列的小根堆顺序：
+				// f 值更小的状态优先，其次再比较 h 和 g。
+				bool operator()( const OpenNode& lhs, const OpenNode& rhs ) const
+				{
+					if ( lhs.f_cost != rhs.f_cost )
+					{
+						return lhs.f_cost > rhs.f_cost;
+					}
+					if ( lhs.h_cost != rhs.h_cost )
+					{
+						return lhs.h_cost > rhs.h_cost;
+					}
+					return lhs.g_cost > rhs.g_cost;
+				}
+			};
+
+			constexpr int kInfinityDistance = std::numeric_limits<int>::max();
+			std::priority_queue<OpenNode, std::vector<OpenNode>, OpenNodeGreater> open_queue;
+			std::vector<int> best_distance( total_cells, kInfinityDistance );
+			std::vector<int> parent_by_index( total_cells, -1 );
+			std::vector<bool> closed( total_cells, false );
+
+			const int start_heuristic = heuristic( start );
+			best_distance[ start_linear_index ] = 0;
+			open_queue.push( { start_linear_index, 0, start_heuristic, start_heuristic } );
+
+			bool found_goal = false;
+			while ( !open_queue.empty() )
+			{
+				const OpenNode current = open_queue.top();
+				open_queue.pop();
+				if ( closed[ current.linear_index ] )
+				{
+					continue;
+				}
+
+				closed[ current.linear_index ] = true;
+				result.statistics.expanded_node_count++;
+				if ( current.linear_index == goal_linear_index )
+				{
+					found_goal = true;
+					break;
+				}
+
+				const Position current_position = FromLinearIndex( current.linear_index, grid_width );
+				for ( const Position& offset : kFourNeighborOffsets )
+				{
+					const int next_row = current_position.row + offset.row;
+					const int next_col = current_position.col + offset.col;
+					if ( !IsPassable( grid, next_row, next_col ) )
+					{
+						continue;
+					}
+
+					const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
+					if ( closed[ next_linear_index ] )
+					{
+						continue;
+					}
+
+					const int candidate_distance = best_distance[ current.linear_index ] + 1;
+					if ( candidate_distance >= best_distance[ next_linear_index ] )
+					{
+						continue;
+					}
+
+					parent_by_index[ next_linear_index ] = current.linear_index;
+					best_distance[ next_linear_index ] = candidate_distance;
+					const Position next_position { next_row, next_col };
+					const int heuristic_value = heuristic( next_position );
+					open_queue.push( { next_linear_index, candidate_distance, candidate_distance + heuristic_value, heuristic_value } );
+				}
+			}
+
+			if ( found_goal )
+			{
+				FinalizeSuccessfulCellResult( result, grid, parent_by_index, goal_linear_index, grid_width );
+			}
+			result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+			return result;
+		}
+	}  // namespace
+
+	// 把算法枚举转成用户可读的名字。
+	// 对比摘要表和路径打印都会使用这里的结果。
+	std::string GetAlgorithmName( AlgorithmId algorithm_id )
+	{
+		switch ( algorithm_id )
+		{
+		case AlgorithmId::Bfs: return "BFS";
+		case AlgorithmId::AStar: return "A*";
+		case AlgorithmId::Dijkstra: return "Dijkstra";
+		case AlgorithmId::BranchStar: return "BranchStar";
+		case AlgorithmId::IbpBStar: return "IBP-B*";
+		default: return "Unknown";
+		}
+	}
+
+	// 返回默认参与对比的一组算法。
+	// 当前包含最短路基线、启发式基线、经典 Branch Star 和你的 IBP-B*。
+	std::vector<AlgorithmId> GetDefaultAlgorithms()
+	{
+		return { AlgorithmId::Bfs, AlgorithmId::AStar, AlgorithmId::Dijkstra, AlgorithmId::BranchStar, AlgorithmId::IbpBStar };
+	}
+
+	// 解析命令行中的算法列表。
+	// 这里会兼容一些常见别名，比如 branch-star、b*、ibp_bstar 等。
+	std::vector<AlgorithmId> ParseAlgorithmList( const std::string& csv_list )
+	{
+		std::vector<AlgorithmId> parsed_algorithms;
+		std::size_t begin_index = 0;
+		while ( begin_index <= csv_list.size() )
+		{
+			const std::size_t comma_index = csv_list.find( ',', begin_index );
+			const std::string raw_token = csv_list.substr( begin_index, comma_index == std::string::npos ? std::string::npos : comma_index - begin_index );
+			const std::string token = NormalizeToken( raw_token );
+
+			if ( !token.empty() )
+			{
+				if ( token == "bfs" )
+				{
+					parsed_algorithms.push_back( AlgorithmId::Bfs );
+				}
+				else if ( token == "astar" || token == "a*" )
+				{
+					parsed_algorithms.push_back( AlgorithmId::AStar );
+				}
+				else if ( token == "dijkstra" )
+				{
+					parsed_algorithms.push_back( AlgorithmId::Dijkstra );
+				}
+				else if ( token == "branchstar" || token == "branch-star" || token == "bstar" || token == "b*" )
+				{
+					parsed_algorithms.push_back( AlgorithmId::BranchStar );
+				}
+				else if ( token == "ibpbstar" || token == "ibp-bstar" || token == "ibp_bstar" || token == "ibp-b*" || token == "ibp" )
+				{
+					parsed_algorithms.push_back( AlgorithmId::IbpBStar );
+				}
+				else
+				{
+					throw std::runtime_error( "Unknown algorithm name: " + raw_token );
+				}
+			}
+
+			if ( comma_index == std::string::npos )
+			{
+				break;
+			}
+			begin_index = comma_index + 1;
+		}
+
+		if ( parsed_algorithms.empty() )
+		{
+			throw std::runtime_error( "Algorithm list must not be empty" );
+		}
+		return parsed_algorithms;
+	}
+
+	// 运行标准四连通 BFS。
+	// 它既是一个独立的比较算法，也是其它启发式算法的最短路参考基线。
+	SearchResult RunBfs( const Grid& grid, Position start, Position goal )
+	{
+		SearchResult result = MakeEmptyResult( AlgorithmId::Bfs );
+		const auto	started_at = TimerClock::now();
+		if ( !IsSearchRequestValid( grid, start, goal ) )
+		{
+			result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+			return result;
+		}
+
+		const int grid_height = static_cast<int>( grid.size() );
+		const int grid_width = static_cast<int>( grid.front().size() );
+		const int total_cells = grid_height * grid_width;
+		const int start_linear_index = ToLinearIndex( start.row, start.col, grid_width );
+		const int goal_linear_index = ToLinearIndex( goal.row, goal.col, grid_width );
+
+		std::queue<int> open_queue;
+		std::vector<int> distance_by_index( total_cells, -1 );
+		std::vector<int> parent_by_index( total_cells, -1 );
+
+		distance_by_index[ start_linear_index ] = 0;
+		open_queue.push( start_linear_index );
+
+		bool found_goal = false;
+		while ( !open_queue.empty() )
+		{
+			const int current_linear_index = open_queue.front();
+			open_queue.pop();
+			result.statistics.expanded_node_count++;
+			if ( current_linear_index == goal_linear_index )
+			{
+				found_goal = true;
+				break;
+			}
+
+			const Position current_position = FromLinearIndex( current_linear_index, grid_width );
+			for ( const Position& offset : kFourNeighborOffsets )
+			{
+				const int next_row = current_position.row + offset.row;
+				const int next_col = current_position.col + offset.col;
+				if ( !IsPassable( grid, next_row, next_col ) )
+				{
+					continue;
+				}
+
+				const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
+				if ( distance_by_index[ next_linear_index ] != -1 )
+				{
+					continue;
+				}
+
+				distance_by_index[ next_linear_index ] = distance_by_index[ current_linear_index ] + 1;
+				parent_by_index[ next_linear_index ] = current_linear_index;
+				open_queue.push( next_linear_index );
+			}
+		}
+
+		if ( found_goal )
+		{
+			FinalizeSuccessfulCellResult( result, grid, parent_by_index, goal_linear_index, grid_width );
+		}
+		result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+		return result;
+	}
+
+	// 运行 A* 搜索。
+	// 当前启发式采用 Manhattan 距离，适用于四连通栅格。
+	SearchResult RunAStar( const Grid& grid, Position start, Position goal )
+	{
+		return RunBestFirstSearch( AlgorithmId::AStar, grid, start, goal, [ goal ]( Position current ) {
+			return ManhattanDistance( current, goal );
+		} );
+	}
+
+	// 运行 Dijkstra 搜索。
+	// 这里本质上是把 A* 的启发式项固定成 0。
+	SearchResult RunDijkstra( const Grid& grid, Position start, Position goal )
+	{
+		return RunBestFirstSearch( AlgorithmId::Dijkstra, grid, start, goal, []( Position ) {
+			return 0;
+		} );
+	}
+
+	SearchResult RunBranchStar( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
+	{
+		// 这里实现的是更贴近 Python 默认版的轻量 Branch Star：
+		// 1. 优先朝目标方向直走
+		// 2. 直走受阻时生成左右两个绕障分支
+		// 3. 一旦重新获得朝目标前进的机会，就回到直推状态
+		// 4. 使用 0-1 BFS：直推/延续绕障代价为 0，碰撞后改道代价为 1
+		SearchResult result = MakeEmptyResult( AlgorithmId::BranchStar );
+		const auto	started_at = TimerClock::now();
+		if ( !IsSearchRequestValid( grid, start, goal ) )
+		{
+			result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+			return result;
+		}
+
+		const int grid_height = static_cast<int>( grid.size() );
+		const int grid_width = static_cast<int>( grid.front().size() );
+		const int total_cells = grid_height * grid_width;
+		constexpr int kModeCount = 2;
+		constexpr int kDirectionCount = 5;
+		constexpr int kInfinityCollision = std::numeric_limits<int>::max();
+		const int total_state_count = total_cells * kModeCount * kDirectionCount;
+		const int start_linear_index = ToLinearIndex( start.row, start.col, grid_width );
+		const int goal_linear_index = ToLinearIndex( goal.row, goal.col, grid_width );
+
+		std::deque<std::pair<int, int>> frontier;
+		std::vector<int> best_collision( total_state_count, kInfinityCollision );
+		std::vector<int> parent_state( total_state_count, -1 );
+		std::vector<int> best_cell_collision( total_cells, kInfinityCollision );
+		std::vector<int> best_cell_state( total_cells, -1 );
+		std::vector<int> discovered_cells;
+
+		const int start_state_id = EncodeBranchStateId( start_linear_index, static_cast<std::uint8_t>( BranchMode::Direct ), 4 );
+		best_collision[ start_state_id ] = 0;
+		best_cell_collision[ start_linear_index ] = 0;
+		best_cell_state[ start_linear_index ] = start_state_id;
+		discovered_cells.push_back( start_linear_index );
+		frontier.push_front( { start_state_id, 0 } );
+
+		// 尝试把一个新的 Branch Star 状态压入前沿。
+		// 这里统一处理边界检查、状态去重、parent 记录，以及 0/1 代价的前后入队。
+		auto TryPushState = [ & ]( int next_row, int next_col, BranchMode next_mode, char next_direction, int parent_state_id, int next_collision, bool high_priority ) {
+			if ( !IsPassable( grid, next_row, next_col ) )
+			{
+				return false;
+			}
+
+			const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
+			const int next_state_id = EncodeBranchStateId( next_linear_index, static_cast<std::uint8_t>( next_mode ), static_cast<std::uint8_t>( DirectionToIndex( next_direction ) ) );
+			if ( next_collision >= best_collision[ next_state_id ] )
+			{
+				return false;
+			}
+
+			best_collision[ next_state_id ] = next_collision;
+			parent_state[ next_state_id ] = parent_state_id;
+			if ( next_collision < best_cell_collision[ next_linear_index ] )
+			{
+				if ( best_cell_collision[ next_linear_index ] == kInfinityCollision )
+				{
+					discovered_cells.push_back( next_linear_index );
+				}
+				best_cell_collision[ next_linear_index ] = next_collision;
+				best_cell_state[ next_linear_index ] = next_state_id;
+			}
+			if ( high_priority )
+			{
+				frontier.push_front( { next_state_id, next_collision } );
+			}
+			else
+			{
+				frontier.push_back( { next_state_id, next_collision } );
+			}
+			return true;
+		};
+
+		auto ExpandState = [ & ]( int current_state_id ) {
+			const BranchStateNode current_state = DecodeBranchStateId( current_state_id );
+			const int current_collision = best_collision[ current_state_id ];
+			const Position current_position = FromLinearIndex( current_state.cell_linear_index, grid_width );
+
+			const BranchMode mode = static_cast<BranchMode>( current_state.mode_index );
+			const char current_direction = IndexToDirection( current_state.direction_index );
+			const char greedy_direction = ChooseGreedyDirection( current_position.row, current_position.col, goal.row, goal.col );
+
+			if ( mode == BranchMode::Direct )
+			{
+				const auto [ greedy_row_delta, greedy_col_delta ] = DirectionDelta( greedy_direction );
+				const int greedy_row = current_position.row + greedy_row_delta;
+				const int greedy_col = current_position.col + greedy_col_delta;
+
+				if ( greedy_direction != 0 && IsPassable( grid, greedy_row, greedy_col ) )
+				{
+					TryPushState( greedy_row, greedy_col, BranchMode::Direct, 0, current_state_id, current_collision, true );
+					return;
+				}
+
+				bool spawned_branch = false;
+				const auto branch_directions = BuildInitialBranchDirections( greedy_direction, options.allow_reverse_when_crawling );
+				for ( char direction_char : branch_directions )
+				{
+					if ( direction_char == 0 )
+					{
+						continue;
+					}
+					const auto [ row_delta, col_delta ] = DirectionDelta( direction_char );
+					spawned_branch = TryPushState( current_position.row + row_delta, current_position.col + col_delta, BranchMode::FollowObstacle, direction_char, current_state_id, current_collision + 1, false )
+						|| spawned_branch;
+				}
+
+				if ( !spawned_branch )
+				{
+					for ( char direction_char : BuildAllDirections() )
+					{
+						const auto [ row_delta, col_delta ] = DirectionDelta( direction_char );
+						TryPushState( current_position.row + row_delta, current_position.col + col_delta, BranchMode::FollowObstacle, direction_char, current_state_id, current_collision + 1, false );
+					}
+				}
+				return;
+			}
+
+			const auto [ greedy_row_delta, greedy_col_delta ] = DirectionDelta( greedy_direction );
+			const int greedy_row = current_position.row + greedy_row_delta;
+			const int greedy_col = current_position.col + greedy_col_delta;
+			if ( greedy_direction != 0 && IsPassable( grid, greedy_row, greedy_col ) )
+			{
+				TryPushState( greedy_row, greedy_col, BranchMode::Direct, 0, current_state_id, current_collision, true );
+				return;
+			}
+
+			if ( current_direction != 0 )
+			{
+				const auto [ continue_row_delta, continue_col_delta ] = DirectionDelta( current_direction );
+				const int continue_row = current_position.row + continue_row_delta;
+				const int continue_col = current_position.col + continue_col_delta;
+				if ( IsPassable( grid, continue_row, continue_col ) )
+				{
+					TryPushState( continue_row, continue_col, BranchMode::FollowObstacle, current_direction, current_state_id, current_collision, true );
+					return;
+				}
+			}
+
+			bool spawned_turn = false;
+			const auto ordered_directions = BuildFollowDirections( current_direction == 0 ? greedy_direction : current_direction, options.allow_reverse_when_crawling );
+			for ( char direction_char : ordered_directions )
+			{
+				if ( direction_char == 0 )
+				{
+					continue;
+				}
+				const auto [ row_delta, col_delta ] = DirectionDelta( direction_char );
+				spawned_turn = TryPushState( current_position.row + row_delta, current_position.col + col_delta, BranchMode::FollowObstacle, direction_char, current_state_id, current_collision + 1, false )
+					|| spawned_turn;
+			}
+
+			if ( !spawned_turn )
+			{
+				for ( char direction_char : BuildAllDirections() )
+				{
+					const auto [ row_delta, col_delta ] = DirectionDelta( direction_char );
+					TryPushState( current_position.row + row_delta, current_position.col + col_delta, BranchMode::FollowObstacle, direction_char, current_state_id, current_collision + 1, false );
+				}
+			}
+		};
+
+		auto ProcessFrontier = [ & ]( int& goal_state_id ) {
+			while ( !frontier.empty() )
+			{
+				const auto [ current_state_id, popped_collision ] = frontier.front();
+				frontier.pop_front();
+				if ( popped_collision != best_collision[ current_state_id ] )
+				{
+					continue;
+				}
+
+				const BranchStateNode current_state = DecodeBranchStateId( current_state_id );
+				result.statistics.expanded_node_count++;
+				if ( current_state.cell_linear_index == goal_linear_index )
+				{
+					goal_state_id = current_state_id;
+					return;
+				}
+
+				ExpandState( current_state_id );
+			}
+		};
+
+		int goal_state_id = -1;
+		while ( goal_state_id == -1 )
+		{
+			ProcessFrontier( goal_state_id );
+			if ( goal_state_id != -1 )
+			{
+				break;
+			}
+
+			bool injected_any = false;
+			const std::size_t discovered_count_snapshot = discovered_cells.size();
+			for ( std::size_t discovered_index = 0; discovered_index < discovered_count_snapshot; ++discovered_index )
+			{
+				const int cell_linear_index = discovered_cells[ discovered_index ];
+				const int parent_state_id = best_cell_state[ cell_linear_index ];
+				const int base_collision = best_cell_collision[ cell_linear_index ];
+				if ( parent_state_id == -1 || base_collision == kInfinityCollision )
+				{
+					continue;
+				}
+
+				const Position base_position = FromLinearIndex( cell_linear_index, grid_width );
+				for ( char direction_char : BuildAllDirections() )
+				{
+					const auto [ row_delta, col_delta ] = DirectionDelta( direction_char );
+					injected_any = TryPushState( base_position.row + row_delta, base_position.col + col_delta, BranchMode::Direct, 0, parent_state_id, base_collision + 1, false ) || injected_any;
+				}
+			}
+
+			if ( !injected_any )
+			{
+				break;
+			}
+		}
+
+		if ( goal_state_id != -1 )
+		{
+			std::vector<Position> reconstructed_path;
+			for ( int trace_state_id = goal_state_id; trace_state_id != -1; trace_state_id = parent_state[ trace_state_id ] )
+			{
+				const BranchStateNode trace_node = DecodeBranchStateId( trace_state_id );
+				reconstructed_path.push_back( FromLinearIndex( trace_node.cell_linear_index, grid_width ) );
+			}
+			std::reverse( reconstructed_path.begin(), reconstructed_path.end() );
+			result.path = std::move( reconstructed_path );
+			result.meet_position = goal;
+			result.statistics.final_path_length = static_cast<int>( result.path.size() );
+			result.success = ValidatePathContiguity( grid, result.path );
+		}
+
+		result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+		return result;
+	}
+
+	// 把现有的 IBP-B* 核心实现包装成统一比较接口。
+	// 这样它就能和 BFS、A*、Dijkstra、Branch Star 使用同一套输入输出结构。
+	SearchResult RunIbpBStar( const Grid& grid, Position start, Position goal, const IbpBStarOptions& options )
+	{
+		// 这里单独包装你当前的 IBP-B* 实现，保证它和 Branch Star 在对比框架里是两个算法。
+		SearchResult result = MakeEmptyResult( AlgorithmId::IbpBStar );
+		const auto	started_at = TimerClock::now();
+		if ( !IsSearchRequestValid( grid, start, goal ) )
+		{
+			result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+			return result;
+		}
+
+		const IBP_BStarAlgorithm::CellPosition legacy_start { start.row, start.col };
+		const IBP_BStarAlgorithm::CellPosition legacy_goal { goal.row, goal.col };
+		IBP_BStarAlgorithm::AlgorithmOptions legacy_options;
+		legacy_options.enable_local_zigzag_expansion = options.enable_local_zigzag_expansion;
+		legacy_options.zigzag_threshold = options.zigzag_threshold;
+
+		IBP_BStarAlgorithm::SearchOutcome legacy_outcome;
+		if ( options.enable_maze_rescue )
+		{
+			legacy_outcome = IBP_BStarAlgorithm::RunIbpBStarZigzagEnhanced( grid, legacy_start, legacy_goal, options.wait_layers, legacy_options );
+		}
+		else
+		{
+			legacy_outcome = IBP_BStarAlgorithm::RunIbpBStar( grid, legacy_start, legacy_goal, options.wait_layers, legacy_options );
+		}
+
+		result.path.reserve( legacy_outcome.final_path.size() );
+		for ( const auto& legacy_position : legacy_outcome.final_path )
+		{
+			result.path.push_back( { legacy_position.row, legacy_position.col } );
+		}
+		result.meet_position = { legacy_outcome.meet_position.row, legacy_outcome.meet_position.col };
+		result.statistics.expanded_node_count = legacy_outcome.statistics.expanded_node_count;
+		result.statistics.final_path_length = static_cast<int>( result.path.size() );
+		result.success = legacy_outcome.success && ValidatePathContiguity( grid, result.path );
+		result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+		return result;
+	}
+
+	// 统一算法分发入口。
+	// main 层只需要传入枚举值，不需要知道每种算法内部的具体实现细节。
+	SearchResult RunAlgorithm( AlgorithmId algorithm_id, const Grid& grid, Position start, Position goal, const AlgorithmOptions& options )
+	{
+		switch ( algorithm_id )
+		{
+		case AlgorithmId::Bfs: return RunBfs( grid, start, goal );
+		case AlgorithmId::AStar: return RunAStar( grid, start, goal );
+		case AlgorithmId::Dijkstra: return RunDijkstra( grid, start, goal );
+		case AlgorithmId::BranchStar: return RunBranchStar( grid, start, goal, options.branch_star );
+		case AlgorithmId::IbpBStar: return RunIbpBStar( grid, start, goal, options.ibp_bstar );
+		default: return MakeEmptyResult( algorithm_id );
+		}
+	}
+}  // namespace pathfinding
