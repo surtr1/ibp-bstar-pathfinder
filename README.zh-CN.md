@@ -1,5 +1,7 @@
 # IBP-B-Star Pathfinding 中文文档
 
+感谢  Twilight-Dream-Of-Magic 的支持 (github:https://github.com/Twilight-Dream-Of-Magic)
+
 ## 1. 项目简介
 
 这是一个基于二维栅格地图的多算法路径规划对比项目，当前包含：

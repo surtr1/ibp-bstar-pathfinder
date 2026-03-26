@@ -1,6 +1,6 @@
 # IBP-B-Star Pathfinding
 
-Thanks to Twilight-Dream-Of-Magic for the support.
+Thanks to Twilight-Dream-Of-Magic for the support. (github:https://github.com/Twilight-Dream-Of-Magic)
 
 ## 1. Overview
 
