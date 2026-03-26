@@ -116,6 +116,16 @@ namespace pathfinding
 			}
 		}
 
+		// 交错竖墙图需要更大的空间，才能体现“局部绕墙找门洞”的特点。
+		void ValidateStaggeredWallArguments( int width, int height, double barrier_density )
+		{
+			ValidateRandomMapArguments( width, height, barrier_density );
+			if ( width < 9 || height < 7 )
+			{
+				throw std::runtime_error( "Staggered wall map requires width >= 9 and height >= 7" );
+			}
+		}
+
 		// 把二维坐标打包成一个 64 位键，便于放进哈希容器里。
 		long long MakeCellKey( int row, int col )
 		{
@@ -213,6 +223,88 @@ namespace pathfinding
 			}
 		}
 
+		map_instance.grid[ map_instance.start.row ][ map_instance.start.col ] = 0;
+		map_instance.grid[ map_instance.goal.row ][ map_instance.goal.col ] = 0;
+		return map_instance;
+	}
+
+	// 生成一张“交错竖墙随机图”。
+	// 这类地图由一系列几乎贯穿全图的竖墙组成，但每面墙都会随机留一个门洞，
+	// 且门洞位置在上侧和下侧之间交替摆动。
+	// 相比普通随机障碍图，这种结构更容易体现 BranchStar / IBP-B* 的贴边绕障能力。
+	MapInstance GenerateStaggeredWallMap( int width, int height, double barrier_density, std::uint32_t seed )
+	{
+		ValidateStaggeredWallArguments( width, height, barrier_density );
+
+		MapInstance map_instance;
+		map_instance.grid.assign( height, std::vector<int>( width, 0 ) );
+		map_instance.start = { height / 2, 0 };
+		map_instance.goal = { height / 2, width - 1 };
+
+		std::mt19937 prng( seed );
+		std::uniform_real_distribution<double> unit_distribution( 0.0, 1.0 );
+
+		// 通过调节门洞大小和墙间距，让 barrier_density 既影响地图复杂度，
+		// 又不至于把整张图变成近似迷宫。
+		const int outer_margin = std::max( 1, height / 10 );
+		const int gate_half_span = std::max( 1, std::min( height / 6, 1 + static_cast<int>( barrier_density * 4.0 ) ) );
+		const int min_spacing = 3;
+		const int max_spacing = std::max( min_spacing, 8 - static_cast<int>( barrier_density * 5.0 ) );
+		std::uniform_int_distribution<int> spacing_distribution( min_spacing, max_spacing );
+
+		// 首列和末列保持开阔，方便算法从边缘进入障碍区。
+		const int first_barrier_column = std::max( 2, width / 10 );
+		int current_column = first_barrier_column;
+		bool gate_near_top = ( seed % 2u ) == 0u;
+
+		while ( current_column < width - 2 )
+		{
+			// 让门洞在上半区和下半区交替出现，迫使路径不断做局部绕障。
+			int gate_center_row = height / 2;
+			if ( gate_near_top )
+			{
+				const int low = outer_margin + gate_half_span;
+				const int high = std::max( low, height / 3 );
+				std::uniform_int_distribution<int> gate_distribution( low, std::min( height - 1 - outer_margin - gate_half_span, high ) );
+				gate_center_row = gate_distribution( prng );
+			}
+			else
+			{
+				const int low = std::max( outer_margin + gate_half_span, ( height * 2 ) / 3 );
+				const int high = height - 1 - outer_margin - gate_half_span;
+				std::uniform_int_distribution<int> gate_distribution( low, high );
+				gate_center_row = gate_distribution( prng );
+			}
+
+			const int gate_start_row = std::max( 1, gate_center_row - gate_half_span );
+			const int gate_end_row = std::min( height - 2, gate_center_row + gate_half_span );
+			const int barrier_thickness = ( barrier_density >= 0.6 && current_column + 1 < width - 2 && unit_distribution( prng ) < 0.35 ) ? 2 : 1;
+
+			for ( int thickness_index = 0; thickness_index < barrier_thickness; ++thickness_index )
+			{
+				const int barrier_column = current_column + thickness_index;
+				for ( int row = 0; row < height; ++row )
+				{
+					if ( row >= gate_start_row && row <= gate_end_row )
+					{
+						continue;
+					}
+					map_instance.grid[ row ][ barrier_column ] = 1;
+				}
+			}
+
+			current_column += barrier_thickness + spacing_distribution( prng );
+			gate_near_top = !gate_near_top;
+		}
+
+		// 起终点附近留一个小缓冲区，避免一开始就直接撞上障碍。
+		for ( int row = 0; row < height; ++row )
+		{
+			map_instance.grid[ row ][ 0 ] = 0;
+			map_instance.grid[ row ][ 1 ] = 0;
+			map_instance.grid[ row ][ width - 1 ] = 0;
+			map_instance.grid[ row ][ width - 2 ] = 0;
+		}
 		map_instance.grid[ map_instance.start.row ][ map_instance.start.col ] = 0;
 		map_instance.grid[ map_instance.goal.row ][ map_instance.goal.col ] = 0;
 		return map_instance;

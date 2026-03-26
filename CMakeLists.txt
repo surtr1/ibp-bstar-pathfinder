@@ -48,7 +48,3 @@ add_executable(ibp_bstar_zigzag_mode
 	apps/ibp_bstar_zigzag_demo_main.cpp
 )
 target_link_libraries(ibp_bstar_zigzag_mode PRIVATE ibp_bstar_app_support)
-
-add_executable(ibp_bstar_paper_strict
-	legacy/IBP-B-Star_Pathfinding_PaperStrict.cpp
-)

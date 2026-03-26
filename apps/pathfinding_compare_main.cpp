@@ -5,10 +5,25 @@
 #include <exception>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace
 {
+	// 在真正解析参数前，先快速判断用户是否请求了 JSON 输出。
+	// 这样即便后续解析或建图失败，也能尽量返回结构化错误对象。
+	bool WantsJsonOutput( int argc, char** argv )
+	{
+		for ( int index = 1; index < argc; ++index )
+		{
+			if ( std::string( argv[ index ] ) == "--json" )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// 根据 CompareConfig 构造本轮实验要用的地图实例。
 	// 这里统一处理三种来源：文件地图、随机障碍图、完美迷宫。
 	pathfinding::MapInstance BuildMapInstance( const pathfinding::CompareConfig& config )
@@ -19,6 +34,10 @@ namespace
 		if ( config.use_maze_map )
 		{
 			map_instance = GeneratePerfectMaze( config.random_width, config.random_height, config.seed );
+		}
+		else if ( config.use_staggered_wall_map )
+		{
+			map_instance = GenerateStaggeredWallMap( config.random_width, config.random_height, config.random_wall_probability, config.seed );
 		}
 		else if ( config.use_random_map && config.map_file_path.empty() )
 		{
@@ -48,26 +67,6 @@ namespace
 		}
 		return map_instance;
 	}
-
-	// 打印本轮实验所使用的地图来源摘要。
-	// 这样在保存控制台输出时，结果本身就带有最关键的实验上下文。
-	void PrintMapSourceSummary( const pathfinding::CompareConfig& config )
-	{
-		using namespace pathfinding;
-
-		if ( config.use_maze_map )
-		{
-			std::cout << "Map source: perfect maze " << config.random_width << "x" << config.random_height << " seed=" << config.seed << "\n";
-		}
-		else if ( config.use_random_map && config.map_file_path.empty() )
-		{
-			std::cout << "Map source: random grid " << config.random_width << "x" << config.random_height << " p=" << config.random_wall_probability << " seed=" << config.seed << "\n";
-		}
-		else
-		{
-			std::cout << "Map source: file " << config.map_file_path << "\n";
-		}
-	}
 }  // namespace
 
 // 程序总入口：
@@ -82,15 +81,12 @@ int main( int argc, char** argv )
 
 	using namespace pathfinding;
 
+	const bool json_requested = WantsJsonOutput( argc, argv );
 	CompareConfig config;
 	try
 	{
 		ParseCompareArgs( argc, argv, config );
 		const MapInstance map_instance = BuildMapInstance( config );
-
-		PrintMapSourceSummary( config );
-		std::cout << "Start=(" << map_instance.start.row << ", " << map_instance.start.col << ") "
-				  << "Goal=(" << map_instance.goal.row << ", " << map_instance.goal.col << ")\n";
 
 		std::vector<SearchResult> results;
 		results.reserve( config.algorithms.size() );
@@ -98,6 +94,16 @@ int main( int argc, char** argv )
 		{
 			results.push_back( RunAlgorithm( algorithm_id, map_instance.grid, map_instance.start, map_instance.goal, config.algorithm_options ) );
 		}
+
+		if ( config.output_json )
+		{
+			PrintCompareJson( config, map_instance, results, std::cout );
+			return 0;
+		}
+
+		std::cout << "Map source: " << DescribeMapSource( config ) << "\n";
+		std::cout << "Start=(" << map_instance.start.row << ", " << map_instance.start.col << ") "
+				  << "Goal=(" << map_instance.goal.row << ", " << map_instance.goal.col << ")\n";
 
 		if ( config.print_summary )
 		{
@@ -124,6 +130,11 @@ int main( int argc, char** argv )
 	}
 	catch ( const std::exception& error )
 	{
+		if ( json_requested )
+		{
+			PrintCompareJsonError( error.what(), std::cout );
+			return 1;
+		}
 		std::cerr << "Error: " << error.what() << "\n";
 		return 1;
 	}

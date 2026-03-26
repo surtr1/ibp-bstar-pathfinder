@@ -1,246 +1,155 @@
 # IBP-B-Star Pathfinding
 
+Thanks to Twilight-Dream-Of-Magic for the support.
+
 ## 1. Overview
 
-This repository is organized as a **multi-algorithm pathfinding comparison project**.
-
-It currently compares:
+This repository is a grid-based pathfinding comparison project. It currently includes:
 
 - `BFS`
 - `A*`
 - `Dijkstra`
-- `Branch Star`
+- `B* PaperCrawl`
+- `B* GreedyLite`
+- `B* Robust`
 - `IBP-B*`
 
-Two B*-related algorithms are intentionally kept separate:
+The project is not only an algorithm implementation demo. It also includes:
 
-- `Branch Star`
-  - the classic branch-based obstacle-bypassing idea
-  - move greedily toward the goal, then split into obstacle-following branches when blocked
-- `IBP-B*`
-  - your optimized implementation
-  - based on the intelligent bi-directional parallel B* paper and its extensions
+- a unified comparison driver
+- curated map files
+- JSON output for external tools
+- a PySide6 GUI
 
----
+## 2. B* Variants in This Repository
 
-## 2. Project Layout
+The three B* variants are intentionally kept separate:
 
-The project is now organized by responsibility:
+- `B* PaperCrawl`
+  - the current default Zhao-style / paper-style variant
+  - entry: `RunBranchStar(...)`
+- `B* GreedyLite`
+  - a lighter classic greedy branch-following variant
+  - entry: `RunBranchStarClassic(...)`
+- `B* Robust`
+  - a heavier fallback-oriented comparison variant
+  - entry: `RunBranchStarLegacy(...)`
+
+`IBP-B*` is your optimized bidirectional enhanced algorithm and is wrapped through `RunIbpBStar(...)`.
+
+## 3. Project Layout
 
 - `apps/`
   - executable entry points
-  - `pathfinding_compare_main.cpp`
-  - `ibp_bstar_zigzag_demo_main.cpp`
-
 - `include/`
-  - public headers shared by executables and libraries
-  - `pathfinding_types.hpp`
-  - `pathfinding_grid.hpp`
-  - `pathfinding_algorithms.hpp`
-  - `pathfinding_compare.hpp`
-  - `ibp_bstar_core.hpp`
-  - `ibp_bstar_app.hpp`
-
+  - shared headers
 - `src/`
-  - implementation files
-  - `pathfinding_grid.cpp`
-  - `pathfinding_algorithms.cpp`
-  - `pathfinding_compare.cpp`
-  - `ibp_bstar_core.cpp`
-  - `ibp_bstar_app.cpp`
-
-- `legacy/`
-  - older standalone or compatibility code
-  - `IBP-B-Star_Pathfinding_PaperStrict.cpp`
-  - `ibp_bstar.hpp`
-  - `bfs_pathfinder.cpp`
-
+  - main implementations
 - `maps/`
-  - sample map files
-  - `map.txt`
-
+  - curated map files
 - `scripts/`
-  - reference / experiment scripts
-  - `AStar-BStar New Implementation.py`
-
+  - GUI and reference scripts
 - `docs/papers/`
-  - related papers and PDFs
-
-This layout keeps benchmark code, algorithm code, legacy code, scripts, and reference materials separated.
-
----
-
-## 3. Algorithm Meaning in This Repository
-
-### 3.1 Branch Star
-
-`Branch Star` here means the classic branch-based obstacle bypassing strategy:
-
-1. move greedily toward the goal
-2. continue straight if the preferred direction is free
-3. when blocked, branch around the obstacle
-4. once a branch regains a valid goal-oriented move, switch back to direct motion
-5. succeed if one branch reaches the goal
-
-Current unified entry:
-
-- `RunBranchStar(...)`
-- implemented in `src/pathfinding_algorithms.cpp`
-
-### 3.2 IBP-B*
-
-`IBP-B*` here is your optimized algorithm with features such as:
-
-- bidirectional expansion
-- greedy advancement
-- obstacle crawling
-- rebirth
-- concave pre-exploration
-- optional local zigzag expansion
-- optional maze rescue
-
-It is exposed through:
-
-- `RunIbpBStar(...)`
-- wrapper in `src/pathfinding_algorithms.cpp`
-
-The core implementation remains in:
-
-- `src/ibp_bstar_core.cpp`
-
----
+  - related papers
 
 ## 4. Build
 
 ### 4.1 CMake
-
-Recommended:
 
 ```bash
 cmake -S . -B build
 cmake --build build --config Release
 ```
 
-Main targets:
-
-- `pathfinding_compare`
-- `ibp_bstar_zigzag_mode`
-- `ibp_bstar_paper_strict`
-
-### 4.2 Manual Build of the Comparison Program
+### 4.2 Manual Build
 
 ```bash
 g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -fsigned-char -finput-charset=UTF-8 -fexec-charset=UTF-8 -Iinclude apps/pathfinding_compare_main.cpp src/pathfinding_grid.cpp src/pathfinding_algorithms.cpp src/pathfinding_compare.cpp src/ibp_bstar_core.cpp -o pathfinding_compare
 ```
 
-### 4.3 Manual Build of the Legacy Zigzag Demo
-
-```bash
-g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -fsigned-char -finput-charset=UTF-8 -fexec-charset=UTF-8 -Iinclude apps/ibp_bstar_zigzag_demo_main.cpp src/ibp_bstar_core.cpp src/ibp_bstar_app.cpp -o ibp_bstar_zigzag_mode
-```
-
----
-
 ## 5. Example Usage
 
-### 5.1 Compare the Default Algorithm Set
+### 5.1 Compare the default set
 
 ```bash
-./pathfinding_compare --map maps/map.txt --no-print --ascii
+./pathfinding_compare --map maps/ring_obstacle.txt --no-print --ascii
 ```
 
-### 5.2 Compare Only Branch Star and IBP-B*
+### 5.2 Compare paper B* and IBP-B*
 
 ```bash
-./pathfinding_compare --map maps/map.txt --algorithms branchstar,ibp_bstar --no-print --ascii
+./pathfinding_compare --map maps/ring_obstacle.txt --algorithms bstar_paper,ibp_bstar --no-print --ascii
 ```
 
-### 5.3 Random Map
+### 5.3 Compare all B* variants
+
+```bash
+./pathfinding_compare --map maps/one_blockers.txt --algorithms bstar_paper,bstar_greedy_lite,bstar_robust,ibp_bstar --no-print --ascii
+```
+
+### 5.4 Random map
 
 ```bash
 ./pathfinding_compare --random 64 64 0.25 --seed 12345 --no-print
 ```
 
-### 5.4 Perfect Maze
+### 5.5 Staggered wall map
 
 ```bash
-./pathfinding_compare --maze 31 31 --seed 7 --algorithms branchstar,ibp_bstar --no-print
+./pathfinding_compare --staggered-walls 120 60 0.35 --seed 11 --branch-no-reverse --no-print
 ```
 
-### 5.5 Run IBP-B* in a More Paper-Strict Style
+### 5.6 Perfect maze
 
 ```bash
-./pathfinding_compare --map maps/map.txt --algorithms ibp_bstar --ibp-paper-strict --no-print
+./pathfinding_compare --maze 31 31 --seed 7 --algorithms bstar_paper,ibp_bstar --no-print
 ```
 
-### 5.6 Disable Reverse Crawling in Branch Star
+### 5.7 Paper-strict IBP-B*
 
 ```bash
-./pathfinding_compare --map maps/map.txt --algorithms branchstar --branch-no-reverse --no-print
+./pathfinding_compare --map maps/closed_goal.txt --algorithms ibp_bstar --ibp-paper-strict --no-print
 ```
 
-### 5.7 Print Rendered Paths
+### 5.8 JSON output
 
 ```bash
-./pathfinding_compare --map maps/map.txt --algorithms bfs,branchstar,ibp_bstar --print-path --ascii
+./pathfinding_compare --map maps/ring_obstacle.txt --algorithms astar,bstar_paper,ibp_bstar --json > result.json
 ```
 
----
+## 6. GUI
 
-## 6. CLI Options
+Install the dependency:
 
-### 6.1 Map Source
+```bash
+python -m pip install -r scripts/requirements-gui.txt
+```
 
-- `--map FILE`
-- `--random W H P`
-- `--maze W H`
-- `--seed N`
+Run the viewer:
 
-### 6.2 Algorithm Selection
+```bash
+python scripts/pathfinding_gui.py
+```
 
-- `--algorithms bfs,astar,dijkstra,branchstar,ibp_bstar`
+The GUI:
 
-Accepted aliases include:
+- calls the compiled `pathfinding_compare` executable through `subprocess`
+- requests `--json` output
+- renders the map and selected path
+- supports path overlay
+- supports start/goal override and click-picking
 
-- `branchstar`
-- `branch-star`
-- `b*`
-- `ibp_bstar`
-- `ibp-bstar`
-- `ibp`
+By default, the GUI now looks for `pathfinding_compare.exe` in the current project directory first.
 
-### 6.3 Start / Goal Overrides
+## 7. Maps
 
-- `--sx R --sy C`
-- `--ex R --ey C`
+All curated map files are now stored directly under `maps/`.
 
-### 6.4 IBP-B* Options
+See [maps/README.md](/d:/编程/C&C++/项目/IBP-BSTAR算法/IBP-B-StarPathfinding/maps/README.md) for the current map list and short descriptions.
 
-- `--ibp-wait N`
-- `--ibp-paper-strict`
-- `--ibp-zigzag`
-- `--ibp-zigzag-threshold N`
-- `--ibp-rescue`
-- `--no-ibp-rescue`
+## 8. Output Fields
 
-### 6.5 Branch Star Options
-
-- `--branch-no-reverse`
-
-### 6.6 Output Options
-
-- `--print-path`
-- `--no-print`
-- `--no-summary`
-- `--ascii`
-- `--unicode`
-- `--arrow`
-
----
-
-## 7. Output Fields
-
-The summary table currently prints:
+The summary table prints:
 
 - `Algorithm`
 - `Success`
@@ -255,29 +164,6 @@ Where:
 - `Expanded` is the number of expanded nodes or states
 - `Time(us)` is runtime in microseconds
 - `GapToBFS` is the path-length difference relative to BFS
-
----
-
-## 8. Map Format
-
-The text map loader supports:
-
-- `+` for walls
-- `.` for free cells
-- `S` for start
-- `E` for goal
-
-Example:
-
-```text
-+++++++
-S...+..+
-.+.+.+.+
-.+...+E+
-+++++++
-```
-
----
 
 ## 9. References
 

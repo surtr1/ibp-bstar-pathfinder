@@ -35,6 +35,25 @@ namespace pathfinding
 			std::uint8_t direction_index = 4;
 		};
 
+		struct ClassicBranchNode
+		{
+			int		 cell_linear_index = -1;
+			int		 parent_node_index = -1;
+			BranchMode mode = BranchMode::Direct;
+			char	 direction = 0;
+			int		 collision_count = 0;
+		};
+
+		struct PaperBranchNode
+		{
+			int		 cell_linear_index = -1;
+			int		 parent_node_index = -1;
+			BranchMode mode = BranchMode::Direct;
+			char	 travel_direction = 0;
+			char	 original_collision_direction = 0;
+			int		 collision_count = 0;
+		};
+
 		constexpr std::array<Position, 4> kFourNeighborOffsets = { Position { -1, 0 }, Position { 1, 0 }, Position { 0, -1 }, Position { 0, 1 } };
 
 		// 把二维坐标映射到一维数组下标，方便连续存储访问状态。
@@ -373,7 +392,9 @@ namespace pathfinding
 		case AlgorithmId::Bfs: return "BFS";
 		case AlgorithmId::AStar: return "A*";
 		case AlgorithmId::Dijkstra: return "Dijkstra";
-		case AlgorithmId::BranchStar: return "BranchStar";
+		case AlgorithmId::BranchStar: return "B* PaperCrawl";
+		case AlgorithmId::BranchStarClassic: return "B* GreedyLite";
+		case AlgorithmId::BranchStarLegacy: return "B* Robust";
 		case AlgorithmId::IbpBStar: return "IBP-B*";
 		default: return "Unknown";
 		}
@@ -412,9 +433,24 @@ namespace pathfinding
 				{
 					parsed_algorithms.push_back( AlgorithmId::Dijkstra );
 				}
-				else if ( token == "branchstar" || token == "branch-star" || token == "bstar" || token == "b*" )
+				else if ( token == "branchstar" || token == "branch-star" || token == "bstar" || token == "b*" || token == "bstarpaper"
+						  || token == "bstar_paper" || token == "bstarpapercrawl" || token == "bstar_papercrawl" || token == "bstar-paper"
+						  || token == "bstar-paper-crawl" || token == "bstar_paper_crawl" )
 				{
 					parsed_algorithms.push_back( AlgorithmId::BranchStar );
+				}
+				else if ( token == "branchstarclassic" || token == "branch-star-classic" || token == "branchstar_classic" || token == "branchstareasy"
+						  || token == "branch-star-easy" || token == "branchstar_easy" || token == "bstarlite" || token == "bstar_lite"
+						  || token == "bstargreedylite" || token == "bstar_greedylite" || token == "bstar-greedy-lite" || token == "bstar_greedy_lite" )
+				{
+					parsed_algorithms.push_back( AlgorithmId::BranchStarClassic );
+				}
+				else if ( token == "branchstarlegacy" || token == "branch-star-legacy" || token == "branchstar_legacy" || token == "branchstarfull"
+						  || token == "branch-star-full" || token == "branchstar_full" || token == "bstarrobust" || token == "bstar_robust"
+						  || token == "bstarfallback" || token == "bstar_fallback" || token == "bstar-robust" || token == "bstar-robust-fallback"
+						  || token == "bstar_robust_fallback" )
+				{
+					parsed_algorithms.push_back( AlgorithmId::BranchStarLegacy );
 				}
 				else if ( token == "ibpbstar" || token == "ibp-bstar" || token == "ibp_bstar" || token == "ibp-b*" || token == "ibp" )
 				{
@@ -527,12 +563,521 @@ namespace pathfinding
 
 	SearchResult RunBranchStar( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
 	{
-		// 这里实现的是更贴近 Python 默认版的轻量 Branch Star：
-		// 1. 优先朝目标方向直走
-		// 2. 直走受阻时生成左右两个绕障分支
-		// 3. 一旦重新获得朝目标前进的机会，就回到直推状态
-		// 4. 使用 0-1 BFS：直推/延续绕障代价为 0，碰撞后改道代价为 1
+		// 论文语义版 Branch Star：
+		// 1. 自由探索点优先沿主方向向目标推进
+		// 2. 首次撞障后，按“除当前前进方向外的其它方向”生成绕障分支
+		// 3. 绕障分支优先尝试回到最初被挡住的方向
+		// 4. 若回归失败，则继续沿当前绕障方向推进
+		// 5. 若当前绕障方向也失败，则尝试原始碰撞方向的反方向
+		//
+		// 这里不是直接照搬旧的轻量 FIFO 版本，而是引入“碰撞次数优先”的 0-1 BFS 风格前沿：
+		// - 自由推进 / 继续绕障视为 0 代价
+		// - 首次因障碍切换到绕障视为 1 代价
+		//
+		// 这样既保留了 Zhao Qingsong(2010) 被后续 IBP-B* 论文引用时描述的自由探索 / crawling 语义，
+		// 也比单纯 FIFO 更稳，避免轻量版在随机图上过早把可行分支剪死。
 		SearchResult result = MakeEmptyResult( AlgorithmId::BranchStar );
+		const auto	started_at = TimerClock::now();
+		if ( !IsSearchRequestValid( grid, start, goal ) )
+		{
+			result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+			return result;
+		}
+
+		const int grid_height = static_cast<int>( grid.size() );
+		const int grid_width = static_cast<int>( grid.front().size() );
+		const int total_cells = grid_height * grid_width;
+		constexpr int kInfinityCollision = std::numeric_limits<int>::max();
+		const int start_linear_index = ToLinearIndex( start.row, start.col, grid_width );
+		const int goal_linear_index = ToLinearIndex( goal.row, goal.col, grid_width );
+
+		std::deque<int> frontier;
+		std::vector<PaperBranchNode> nodes;
+		nodes.reserve( total_cells * 6 );
+		std::vector<int> best_direct_collision( total_cells, kInfinityCollision );
+		std::vector<int> best_crawling_collision( total_cells * 16, kInfinityCollision );
+		std::vector<int> discovered_node_indices;
+		discovered_node_indices.reserve( total_cells * 2 );
+
+		auto EncodeCrawlingStateIndex = [ & ]( int cell_linear_index, char travel_direction, char original_collision_direction ) {
+			const int travel_direction_index = DirectionToIndex( travel_direction );
+			const int original_direction_index = DirectionToIndex( original_collision_direction );
+			if ( travel_direction_index < 0 || travel_direction_index >= 4 || original_direction_index < 0 || original_direction_index >= 4 )
+			{
+				return -1;
+			}
+			return cell_linear_index * 16 + travel_direction_index * 4 + original_direction_index;
+		};
+
+		auto PushNode = [ & ]( int next_row,
+							   int next_col,
+							   BranchMode next_mode,
+							   char next_travel_direction,
+							   char original_collision_direction,
+							   int parent_node_index,
+							   int collision_count,
+							   bool high_priority ) {
+			if ( !IsPassable( grid, next_row, next_col ) )
+			{
+				return false;
+			}
+
+			const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
+			if ( next_mode == BranchMode::Direct )
+			{
+				if ( collision_count >= best_direct_collision[ next_linear_index ] )
+				{
+					return false;
+				}
+			}
+			else
+			{
+				const int crawling_state_index = EncodeCrawlingStateIndex( next_linear_index, next_travel_direction, original_collision_direction );
+				if ( crawling_state_index == -1 || collision_count >= best_crawling_collision[ crawling_state_index ] )
+				{
+					return false;
+				}
+			}
+
+			nodes.push_back( { next_linear_index, parent_node_index, next_mode, next_travel_direction, original_collision_direction, collision_count } );
+			const int node_index = static_cast<int>( nodes.size() ) - 1;
+			if ( next_mode == BranchMode::Direct )
+			{
+				best_direct_collision[ next_linear_index ] = collision_count;
+			}
+			else
+			{
+				best_crawling_collision[ EncodeCrawlingStateIndex( next_linear_index, next_travel_direction, original_collision_direction ) ] = collision_count;
+			}
+
+			if ( high_priority )
+			{
+				frontier.push_front( node_index );
+			}
+			else
+			{
+				frontier.push_back( node_index );
+			}
+			discovered_node_indices.push_back( node_index );
+			return true;
+		};
+
+		best_direct_collision[ start_linear_index ] = 0;
+		nodes.push_back( { start_linear_index, -1, BranchMode::Direct, 0, 0, 0 } );
+		frontier.push_front( 0 );
+		discovered_node_indices.push_back( 0 );
+
+		int goal_node_index = -1;
+		std::size_t emergency_cursor = 0;
+		while ( true )
+		{
+			while ( !frontier.empty() )
+			{
+				const int current_node_index = frontier.front();
+				frontier.pop_front();
+				const PaperBranchNode current_node = nodes[ current_node_index ];
+				if ( current_node.mode == BranchMode::Direct )
+				{
+					if ( current_node.collision_count != best_direct_collision[ current_node.cell_linear_index ] )
+					{
+						continue;
+					}
+				}
+				else
+				{
+					const int crawling_state_index = EncodeCrawlingStateIndex(
+						current_node.cell_linear_index,
+						current_node.travel_direction,
+						current_node.original_collision_direction );
+					if ( crawling_state_index == -1 || current_node.collision_count != best_crawling_collision[ crawling_state_index ] )
+					{
+						continue;
+					}
+				}
+
+				result.statistics.expanded_node_count++;
+				if ( current_node.cell_linear_index == goal_linear_index )
+				{
+					goal_node_index = current_node_index;
+					break;
+				}
+
+				const Position current_position = FromLinearIndex( current_node.cell_linear_index, grid_width );
+				const char greedy_direction = ChooseGreedyDirection( current_position.row, current_position.col, goal.row, goal.col );
+				const bool is_crawling = current_node.mode == BranchMode::FollowObstacle && current_node.travel_direction != 0;
+				const char movement_direction = is_crawling ? current_node.travel_direction : greedy_direction;
+				if ( movement_direction == 0 )
+				{
+					continue;
+				}
+
+				const auto movement_offset = DirectionDelta( movement_direction );
+				const int next_row = current_position.row + movement_offset.first;
+				const int next_col = current_position.col + movement_offset.second;
+
+				if ( current_node.mode == BranchMode::Direct )
+				{
+					if ( PushNode( next_row, next_col, BranchMode::Direct, 0, 0, current_node_index, current_node.collision_count, true ) )
+					{
+						continue;
+					}
+
+					const auto branch_directions = BuildInitialBranchDirections( movement_direction, options.allow_reverse_when_crawling );
+					for ( char direction_char : branch_directions )
+					{
+						if ( direction_char == 0 )
+						{
+							continue;
+						}
+						const auto branch_offset = DirectionDelta( direction_char );
+						PushNode(
+							current_position.row + branch_offset.first,
+							current_position.col + branch_offset.second,
+							BranchMode::FollowObstacle,
+							direction_char,
+							movement_direction,
+							current_node_index,
+							current_node.collision_count + 1,
+							false );
+					}
+					continue;
+				}
+
+				const char original_collision_direction =
+					current_node.original_collision_direction == 0 ? movement_direction : current_node.original_collision_direction;
+				const auto original_offset = DirectionDelta( original_collision_direction );
+				const int original_row = current_position.row + original_offset.first;
+				const int original_col = current_position.col + original_offset.second;
+
+				if ( PushNode( original_row, original_col, BranchMode::Direct, 0, 0, current_node_index, current_node.collision_count, true ) )
+				{
+					continue;
+				}
+
+				if ( PushNode(
+						 next_row,
+						 next_col,
+						 BranchMode::FollowObstacle,
+						 movement_direction,
+						 original_collision_direction,
+						 current_node_index,
+						 current_node.collision_count,
+						 true ) )
+				{
+					continue;
+				}
+
+				const char reverse_direction = OppositeDirection( original_collision_direction );
+				if ( options.allow_reverse_when_crawling && reverse_direction != 0 )
+				{
+					const auto reverse_offset = DirectionDelta( reverse_direction );
+					if ( PushNode(
+						current_position.row + reverse_offset.first,
+						current_position.col + reverse_offset.second,
+						BranchMode::FollowObstacle,
+						reverse_direction,
+						original_collision_direction,
+						current_node_index,
+						current_node.collision_count,
+						false ) )
+					{
+						continue;
+					}
+				}
+
+				// 当严格的“回归原方向 / 继续当前方向 / 走原方向反向”都失败时，
+				// 增加一次局部转角扩展。
+				// 这一步相当于把 Python 参考实现里的 cornering 思想压缩成一个轻量 fallback，
+				// 让论文语义版 B* 在四连通随机图上不至于过早陷入局部死角。
+				const auto corner_directions = BuildFollowDirections( movement_direction, options.allow_reverse_when_crawling );
+				for ( char direction_char : corner_directions )
+				{
+					if ( direction_char == 0 || direction_char == movement_direction )
+					{
+						continue;
+					}
+					const auto corner_offset = DirectionDelta( direction_char );
+					PushNode(
+						current_position.row + corner_offset.first,
+						current_position.col + corner_offset.second,
+						BranchMode::FollowObstacle,
+						direction_char,
+						original_collision_direction,
+						current_node_index,
+						current_node.collision_count + 1,
+						false );
+				}
+			}
+
+			if ( goal_node_index != -1 )
+			{
+				break;
+			}
+
+			bool injected_new_frontier = false;
+			const std::size_t emergency_end = discovered_node_indices.size();
+			for ( ; emergency_cursor < emergency_end; ++emergency_cursor )
+			{
+				const int seed_node_index = discovered_node_indices[ emergency_cursor ];
+				const PaperBranchNode& seed_node = nodes[ seed_node_index ];
+				const Position seed_position = FromLinearIndex( seed_node.cell_linear_index, grid_width );
+				for ( char direction_char : BuildAllDirections() )
+				{
+					const auto offset = DirectionDelta( direction_char );
+					injected_new_frontier = PushNode(
+												seed_position.row + offset.first,
+												seed_position.col + offset.second,
+												BranchMode::Direct,
+												0,
+												0,
+												seed_node_index,
+												seed_node.collision_count + 1,
+												false )
+						|| injected_new_frontier;
+				}
+			}
+			if ( !injected_new_frontier )
+			{
+				break;
+			}
+		}
+
+		if ( goal_node_index != -1 )
+		{
+			std::vector<Position> reconstructed_path;
+			for ( int trace_node_index = goal_node_index; trace_node_index != -1; trace_node_index = nodes[ trace_node_index ].parent_node_index )
+			{
+				reconstructed_path.push_back( FromLinearIndex( nodes[ trace_node_index ].cell_linear_index, grid_width ) );
+			}
+			std::reverse( reconstructed_path.begin(), reconstructed_path.end() );
+			result.path = std::move( reconstructed_path );
+			result.meet_position = goal;
+			result.statistics.final_path_length = static_cast<int>( result.path.size() );
+			result.success = ValidatePathContiguity( grid, result.path );
+		}
+
+		result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+		return result;
+	}
+
+	SearchResult RunBranchStarClassic( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
+	{
+		// 经典轻量版 Branch Star：
+		// 1. 直行阶段只尝试朝目标方向推进
+		// 2. 直行受阻时，生成左右两个贴边分支
+		// 3. 贴边阶段优先尝试重新回归目标方向，否则继续沿当前绕障方向前进
+		// 4. 当贴边方向也受阻时，只尝试局部转向，不再做全局 reinjection
+		SearchResult result = MakeEmptyResult( AlgorithmId::BranchStarClassic );
+		const auto	started_at = TimerClock::now();
+		if ( !IsSearchRequestValid( grid, start, goal ) )
+		{
+			result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+			return result;
+		}
+
+		const int grid_height = static_cast<int>( grid.size() );
+		const int grid_width = static_cast<int>( grid.front().size() );
+		const int total_cells = grid_height * grid_width;
+		constexpr int kInfinityCollision = std::numeric_limits<int>::max();
+		const int start_linear_index = ToLinearIndex( start.row, start.col, grid_width );
+		const int goal_linear_index = ToLinearIndex( goal.row, goal.col, grid_width );
+
+		std::deque<int> frontier;
+		std::vector<ClassicBranchNode> nodes;
+		nodes.reserve( total_cells * 5 );
+		std::vector<int> best_direct_collision( total_cells, kInfinityCollision );
+		std::vector<int> best_climb_collision( total_cells * 4, kInfinityCollision );
+
+		auto PushDirectNode = [ & ]( int next_row, int next_col, int parent_node_index, int collision_count, bool high_priority ) {
+			if ( !IsPassable( grid, next_row, next_col ) )
+			{
+				return false;
+			}
+
+			const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
+			if ( collision_count >= best_direct_collision[ next_linear_index ] )
+			{
+				return false;
+			}
+
+			best_direct_collision[ next_linear_index ] = collision_count;
+			nodes.push_back( { next_linear_index, parent_node_index, BranchMode::Direct, 0, collision_count } );
+			const int node_index = static_cast<int>( nodes.size() ) - 1;
+			if ( high_priority )
+			{
+				frontier.push_front( node_index );
+			}
+			else
+			{
+				frontier.push_back( node_index );
+			}
+			return true;
+		};
+
+		auto PushClimbNode = [ & ]( int next_row, int next_col, char direction_char, int parent_node_index, int collision_count, bool high_priority ) {
+			if ( !IsPassable( grid, next_row, next_col ) )
+			{
+				return false;
+			}
+
+			const int direction_index = DirectionToIndex( direction_char );
+			if ( direction_index < 0 || direction_index >= 4 )
+			{
+				return false;
+			}
+
+			const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
+			const int best_index = next_linear_index * 4 + direction_index;
+			if ( collision_count >= best_climb_collision[ best_index ] )
+			{
+				return false;
+			}
+
+			best_climb_collision[ best_index ] = collision_count;
+			nodes.push_back( { next_linear_index, parent_node_index, BranchMode::FollowObstacle, direction_char, collision_count } );
+			const int node_index = static_cast<int>( nodes.size() ) - 1;
+			if ( high_priority )
+			{
+				frontier.push_front( node_index );
+			}
+			else
+			{
+				frontier.push_back( node_index );
+			}
+			return true;
+		};
+
+		best_direct_collision[ start_linear_index ] = 0;
+		nodes.push_back( { start_linear_index, -1, BranchMode::Direct, 0, 0 } );
+		frontier.push_front( 0 );
+
+		int goal_node_index = -1;
+		while ( !frontier.empty() )
+		{
+			const int current_node_index = frontier.front();
+			frontier.pop_front();
+
+			const ClassicBranchNode current_node = nodes[ current_node_index ];
+			if ( current_node.mode == BranchMode::Direct )
+			{
+				if ( current_node.collision_count != best_direct_collision[ current_node.cell_linear_index ] )
+				{
+					continue;
+				}
+			}
+			else
+			{
+				const int direction_index = DirectionToIndex( current_node.direction );
+				if ( direction_index < 0 || direction_index >= 4 )
+				{
+					continue;
+				}
+				if ( current_node.collision_count != best_climb_collision[ current_node.cell_linear_index * 4 + direction_index ] )
+				{
+					continue;
+				}
+			}
+
+			result.statistics.expanded_node_count++;
+			if ( current_node.cell_linear_index == goal_linear_index )
+			{
+				goal_node_index = current_node_index;
+				break;
+			}
+
+			const Position current_position = FromLinearIndex( current_node.cell_linear_index, grid_width );
+			const char greedy_direction = ChooseGreedyDirection( current_position.row, current_position.col, goal.row, goal.col );
+
+			if ( current_node.mode == BranchMode::Direct )
+			{
+				const auto [ row_delta, col_delta ] = DirectionDelta( greedy_direction );
+				const int next_row = current_position.row + row_delta;
+				const int next_col = current_position.col + col_delta;
+
+				if ( greedy_direction != 0 && PushDirectNode( next_row, next_col, current_node_index, current_node.collision_count, true ) )
+				{
+					continue;
+				}
+
+				const auto branch_directions = BuildInitialBranchDirections( greedy_direction, options.allow_reverse_when_crawling );
+				for ( char direction_char : branch_directions )
+				{
+					if ( direction_char == 0 )
+					{
+						continue;
+					}
+					const auto [ branch_row_delta, branch_col_delta ] = DirectionDelta( direction_char );
+					PushClimbNode(
+						current_position.row + branch_row_delta,
+						current_position.col + branch_col_delta,
+						direction_char,
+						current_node_index,
+						current_node.collision_count + 1,
+						false );
+				}
+				continue;
+			}
+
+			if ( greedy_direction != 0 )
+			{
+				const auto [ row_delta, col_delta ] = DirectionDelta( greedy_direction );
+				if ( PushDirectNode( current_position.row + row_delta, current_position.col + col_delta, current_node_index, current_node.collision_count, true ) )
+				{
+					continue;
+				}
+			}
+
+			if ( current_node.direction != 0 )
+			{
+				const auto [ row_delta, col_delta ] = DirectionDelta( current_node.direction );
+				if ( PushClimbNode( current_position.row + row_delta, current_position.col + col_delta, current_node.direction, current_node_index, current_node.collision_count, true ) )
+				{
+					continue;
+				}
+			}
+
+			const auto follow_directions = BuildFollowDirections( current_node.direction == 0 ? greedy_direction : current_node.direction, options.allow_reverse_when_crawling );
+			for ( char direction_char : follow_directions )
+			{
+				if ( direction_char == 0 || direction_char == current_node.direction )
+				{
+					continue;
+				}
+				const auto [ row_delta, col_delta ] = DirectionDelta( direction_char );
+				PushClimbNode(
+					current_position.row + row_delta,
+					current_position.col + col_delta,
+					direction_char,
+					current_node_index,
+					current_node.collision_count + 1,
+					false );
+			}
+		}
+
+		if ( goal_node_index != -1 )
+		{
+			std::vector<Position> reconstructed_path;
+			for ( int trace_node_index = goal_node_index; trace_node_index != -1; trace_node_index = nodes[ trace_node_index ].parent_node_index )
+			{
+				reconstructed_path.push_back( FromLinearIndex( nodes[ trace_node_index ].cell_linear_index, grid_width ) );
+			}
+			std::reverse( reconstructed_path.begin(), reconstructed_path.end() );
+			result.path = std::move( reconstructed_path );
+			result.meet_position = goal;
+			result.statistics.final_path_length = static_cast<int>( result.path.size() );
+			result.success = ValidatePathContiguity( grid, result.path );
+		}
+
+		result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
+		return result;
+	}
+
+	SearchResult RunBranchStarLegacy( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
+	{
+		// 这是保留下来的旧版 / 增强版 Branch Star。
+		// 它带有更重的状态建模、全局 reinjection 和更强的兜底行为，
+		// 便于和新的经典轻量版做对比。
+		SearchResult result = MakeEmptyResult( AlgorithmId::BranchStarLegacy );
 		const auto	started_at = TimerClock::now();
 		if ( !IsSearchRequestValid( grid, start, goal ) )
 		{
@@ -818,6 +1363,8 @@ namespace pathfinding
 		case AlgorithmId::AStar: return RunAStar( grid, start, goal );
 		case AlgorithmId::Dijkstra: return RunDijkstra( grid, start, goal );
 		case AlgorithmId::BranchStar: return RunBranchStar( grid, start, goal, options.branch_star );
+		case AlgorithmId::BranchStarClassic: return RunBranchStarClassic( grid, start, goal, options.branch_star );
+		case AlgorithmId::BranchStarLegacy: return RunBranchStarLegacy( grid, start, goal, options.branch_star );
 		case AlgorithmId::IbpBStar: return RunIbpBStar( grid, start, goal, options.ibp_bstar );
 		default: return MakeEmptyResult( algorithm_id );
 		}

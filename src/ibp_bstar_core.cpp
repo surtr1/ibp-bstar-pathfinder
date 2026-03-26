@@ -4,9 +4,7 @@
 #include <array>
 #include <cmath>
 #include <deque>
-#include <queue>
 #include <string>
-#include <unordered_map>
 
 namespace IBP_BStarAlgorithm
 {
@@ -29,11 +27,43 @@ namespace IBP_BStarAlgorithm
 	// ============================================================================
 	namespace
 	{
-		// 四个基本方向到位移的映射表。
-		// 用 char 表示方向，可以和论文里的符号描述保持较高的一致性。
-		using DirectionDeltaMap = std::unordered_map<char, std::pair<int, int>>;
-		const DirectionDeltaMap	 kDirectionDeltaMap = { { 'U', { -1, 0 } }, { 'D', { 1, 0 } }, { 'L', { 0, -1 } }, { 'R', { 0, 1 } } };
-		const std::array<char, 4> kDirectionPriorityOrder = { 'U', 'D', 'L', 'R' };
+		// 四个基本方向按固定索引存放，避免热路径里使用哈希查表。
+		constexpr std::array<char, 4> kDirectionPriorityOrder = { 'U', 'D', 'L', 'R' };
+		constexpr std::array<std::pair<int, int>, 4> kDirectionOffsets = { { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } } };
+
+		constexpr int DirectionToIndex( char direction_char )
+		{
+			switch ( direction_char )
+			{
+			case 'U': return 0;
+			case 'D': return 1;
+			case 'L': return 2;
+			case 'R': return 3;
+			default: return 4;
+			}
+		}
+
+		constexpr char IndexToDirection( int direction_index )
+		{
+			switch ( direction_index )
+			{
+			case 0: return 'U';
+			case 1: return 'D';
+			case 2: return 'L';
+			case 3: return 'R';
+			default: return 0;
+			}
+		}
+
+		constexpr std::pair<int, int> DirectionDelta( char direction_char )
+		{
+			const int direction_index = DirectionToIndex( direction_char );
+			if ( direction_index < 0 || direction_index >= static_cast<int>( kDirectionOffsets.size() ) )
+			{
+				return { 0, 0 };
+			}
+			return kDirectionOffsets[ direction_index ];
+		}
 
 		// 自由模式：按贪心方向推进。
 		// Crawling 模式：已经撞上障碍，沿障碍边缘尝试绕行。
@@ -78,30 +108,6 @@ namespace IBP_BStarAlgorithm
 				return IsCellPassable( grid, base_row - 1, base_col ) && IsCellPassable( grid, base_row + 1, base_col );
 			}
 			return IsCellPassable( grid, base_row, base_col - 1 ) && IsCellPassable( grid, base_row, base_col + 1 );
-		}
-
-		int DirectionToIndex( char direction_char )
-		{
-			switch ( direction_char )
-			{
-			case 'U': return 0;
-			case 'D': return 1;
-			case 'L': return 2;
-			case 'R': return 3;
-			default: return 4;
-			}
-		}
-
-		char IndexToDirection( int direction_index )
-		{
-			switch ( direction_index )
-			{
-			case 0: return 'U';
-			case 1: return 'D';
-			case 2: return 'L';
-			case 3: return 'R';
-			default: return 0;
-			}
 		}
 
 		std::array<char, 4> BuildZigzagStateDirectionPriority( char last_direction, ZigzagTurnBias turn_bias, ZigzagPhase phase,
@@ -406,8 +412,8 @@ namespace IBP_BStarAlgorithm
 			// 判断某个前进方向两侧是否同时被堵住。
 			// 若成立，说明当前推进可能进入了一条“夹缝”或狭道，可触发 rebirth 逻辑。
 			auto [ left_dir_char, right_dir_char ] = LeftRightDirections( direction_char );
-			auto left_offset = kDirectionDeltaMap.at( left_dir_char );
-			auto right_offset = kDirectionDeltaMap.at( right_dir_char );
+			const auto left_offset = DirectionDelta( left_dir_char );
+			const auto right_offset = DirectionDelta( right_dir_char );
 			return IsCellBlocked( grid, row + left_offset.first, col + left_offset.second ) && IsCellBlocked( grid, row + right_offset.first, col + right_offset.second );
 		};
 
@@ -440,15 +446,16 @@ namespace IBP_BStarAlgorithm
 			const CellPosition current_pos = FromIndex( current_linear_index );
 			const int		   current_row = current_pos.row;
 			const int		   current_col = current_pos.col;
-			ObstacleState	   current_state = this_state[ current_linear_index ];
-			const int		   current_depth_value = this_depth[ current_linear_index ];
+			const ObstacleState& current_state = this_state[ current_linear_index ];
+			const int		     current_depth_value = this_depth[ current_linear_index ];
+			const int		     next_depth_value = current_depth_value + 1;
 
 			const char greedy_direction = ChooseGreedyDirection( current_row, current_col, greedy_goal_row, greedy_goal_col );
 			const bool is_crawling = current_state.mode == ExplorationMode::Crawling && current_state.travel_direction != 0;
 
 			// 若已经在 crawling，就延续贴边方向；否则采用新的贪心方向。
 			const char movement_direction = is_crawling ? current_state.travel_direction : greedy_direction;
-			auto	   movement_offset = kDirectionDeltaMap.at( movement_direction );
+			const auto movement_offset = DirectionDelta( movement_direction );
 			const int next_row = current_row + movement_offset.first;
 			const int next_col = current_col + movement_offset.second;
 
@@ -465,7 +472,7 @@ namespace IBP_BStarAlgorithm
 					}
 
 					ObstacleState reset_state;
-					TryVisit( next_row, next_col, current_linear_index, current_depth_value + 1, reset_state, this_depth, this_parent, this_state, this_queue, opposite_depth );
+					TryVisit( next_row, next_col, current_linear_index, next_depth_value, reset_state, this_depth, this_parent, this_state, this_queue, opposite_depth );
 
 					if ( IsConcaveEntry( grid, next_row, next_col, movement_direction ) )
 					{
@@ -475,9 +482,9 @@ namespace IBP_BStarAlgorithm
 						{
 							if ( scan_dir == movement_direction )
 								continue;
-							auto scan_offset = kDirectionDeltaMap.at( scan_dir );
+							const auto scan_offset = DirectionDelta( scan_dir );
 							ObstacleState side_state;
-							TryVisit( current_row + scan_offset.first, current_col + scan_offset.second, current_linear_index, current_depth_value + 1, side_state, this_depth, this_parent,
+							TryVisit( current_row + scan_offset.first, current_col + scan_offset.second, current_linear_index, next_depth_value, side_state, this_depth, this_parent,
 									  this_state, this_queue, opposite_depth );
 						}
 					}
@@ -490,13 +497,13 @@ namespace IBP_BStarAlgorithm
 					// 注意这里不是只试左右，而是按优先级尝试所有非原方向邻居。
 					if ( scan_dir == movement_direction )
 						continue;
-					auto scan_offset = kDirectionDeltaMap.at( scan_dir );
+					const auto scan_offset = DirectionDelta( scan_dir );
 					ObstacleState side_state;
 					side_state.mode = ExplorationMode::Crawling;
 					side_state.travel_direction = scan_dir;
 					side_state.original_collision_direction = movement_direction;
 					side_state.obstacle_hit_count = 1;
-					TryVisit( current_row + scan_offset.first, current_col + scan_offset.second, current_linear_index, current_depth_value + 1, side_state, this_depth, this_parent,
+					TryVisit( current_row + scan_offset.first, current_col + scan_offset.second, current_linear_index, next_depth_value, side_state, this_depth, this_parent,
 							  this_state, this_queue, opposite_depth );
 				}
 				return;
@@ -504,7 +511,7 @@ namespace IBP_BStarAlgorithm
 
 			bool expanded_any = false;
 			const char original_collision_direction = current_state.original_collision_direction == 0 ? movement_direction : current_state.original_collision_direction;
-			auto	   original_offset = kDirectionDeltaMap.at( original_collision_direction );
+			const auto original_offset = DirectionDelta( original_collision_direction );
 			const int original_row = current_row + original_offset.first;
 			const int original_col = current_col + original_offset.second;
 
@@ -512,7 +519,7 @@ namespace IBP_BStarAlgorithm
 			{
 				// 若原先被障碍挡住的方向已经重新可走，则立刻回到自由推进模式。
 				ObstacleState reset_state;
-				expanded_any = TryVisit( original_row, original_col, current_linear_index, current_depth_value + 1, reset_state, this_depth, this_parent, this_state, this_queue, opposite_depth );
+				expanded_any = TryVisit( original_row, original_col, current_linear_index, next_depth_value, reset_state, this_depth, this_parent, this_state, this_queue, opposite_depth );
 			}
 			else if ( IsCellPassable( grid, next_row, next_col ) )
 			{
@@ -521,18 +528,18 @@ namespace IBP_BStarAlgorithm
 				continue_state.mode = ExplorationMode::Crawling;
 				continue_state.travel_direction = movement_direction;
 				continue_state.obstacle_hit_count = current_state.obstacle_hit_count + 1;
-				expanded_any = TryVisit( next_row, next_col, current_linear_index, current_depth_value + 1, continue_state, this_depth, this_parent, this_state, this_queue, opposite_depth );
+				expanded_any = TryVisit( next_row, next_col, current_linear_index, next_depth_value, continue_state, this_depth, this_parent, this_state, this_queue, opposite_depth );
 			}
 			else
 			{
 				// 前进也不行时，尝试绕障反向移动，继续保持 crawling。
 				const char opposite_original_direction = OppositeDirection( original_collision_direction );
-				auto	   opposite_original_offset = kDirectionDeltaMap.at( opposite_original_direction );
+				const auto opposite_original_offset = DirectionDelta( opposite_original_direction );
 				ObstacleState reverse_state = current_state;
 				reverse_state.mode = ExplorationMode::Crawling;
 				reverse_state.travel_direction = opposite_original_direction;
 				reverse_state.obstacle_hit_count = current_state.obstacle_hit_count + 1;
-				expanded_any = TryVisit( current_row + opposite_original_offset.first, current_col + opposite_original_offset.second, current_linear_index, current_depth_value + 1,
+				expanded_any = TryVisit( current_row + opposite_original_offset.first, current_col + opposite_original_offset.second, current_linear_index, next_depth_value,
 										 reverse_state, this_depth, this_parent, this_state, this_queue, opposite_depth )
 					|| expanded_any;
 			}
@@ -545,12 +552,12 @@ namespace IBP_BStarAlgorithm
 				auto [ left_dir_char, right_dir_char ] = LeftRightDirections( movement_direction );
 				for ( char side_dir_char : std::array<char, 2>{ left_dir_char, right_dir_char } )
 				{
-					auto side_offset = kDirectionDeltaMap.at( side_dir_char );
+					const auto side_offset = DirectionDelta( side_dir_char );
 					ObstacleState side_state = current_state;
 					side_state.mode = ExplorationMode::Crawling;
 					side_state.travel_direction = side_dir_char;
 					side_state.obstacle_hit_count = current_state.obstacle_hit_count + 1;
-					expanded_any = TryVisit( current_row + side_offset.first, current_col + side_offset.second, current_linear_index, current_depth_value + 1, side_state, this_depth, this_parent,
+					expanded_any = TryVisit( current_row + side_offset.first, current_col + side_offset.second, current_linear_index, next_depth_value, side_state, this_depth, this_parent,
 											 this_state, this_queue, opposite_depth )
 						|| expanded_any;
 				}
@@ -689,7 +696,7 @@ namespace IBP_BStarAlgorithm
 				// 而在于当存在多个同层备选状态时，让更像“zigzag/winding”的路线先进入搜索前沿。
 				if ( direction_char == 0 )
 					continue;
-				auto [ row_offset, col_offset ] = kDirectionDeltaMap.at( direction_char );
+				const auto [ row_offset, col_offset ] = DirectionDelta( direction_char );
 				const int next_row = current_pos.row + row_offset;
 				const int next_col = current_pos.col + col_offset;
 				if ( !IsCellPassable( grid, next_row, next_col ) )

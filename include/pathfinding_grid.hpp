@@ -42,6 +42,7 @@ namespace pathfinding
 	bool		IsPassable( const Grid& grid, int row, int col );
 	bool		ValidatePathContiguity( const Grid& grid, const std::vector<Position>& path );
 	MapInstance GenerateRandomMap( int width, int height, double wall_probability, std::uint32_t seed );
+	MapInstance GenerateStaggeredWallMap( int width, int height, double barrier_density, std::uint32_t seed );
 	MapInstance LoadMapFromFile( const std::string& file_path, const RenderStyle& render_style = {} );
 	MapInstance GeneratePerfectMaze( int width, int height, std::uint32_t seed );
 	void		RenderGridWithPath( const Grid& grid, const std::vector<Position>& path, Position start, Position goal, const RenderStyle& render_style );

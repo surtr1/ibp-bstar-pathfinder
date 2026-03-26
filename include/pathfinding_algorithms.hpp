@@ -14,6 +14,8 @@ namespace pathfinding
 		AStar,
 		Dijkstra,
 		BranchStar,
+		BranchStarClassic,
+		BranchStarLegacy,
 		IbpBStar
 	};
 
@@ -48,6 +50,8 @@ namespace pathfinding
 	SearchResult RunAStar( const Grid& grid, Position start, Position goal );
 	SearchResult RunDijkstra( const Grid& grid, Position start, Position goal );
 	SearchResult RunBranchStar( const Grid& grid, Position start, Position goal, const BranchStarOptions& options );
+	SearchResult RunBranchStarClassic( const Grid& grid, Position start, Position goal, const BranchStarOptions& options );
+	SearchResult RunBranchStarLegacy( const Grid& grid, Position start, Position goal, const BranchStarOptions& options );
 	SearchResult RunIbpBStar( const Grid& grid, Position start, Position goal, const IbpBStarOptions& options );
 	SearchResult RunAlgorithm( AlgorithmId algorithm_id, const Grid& grid, Position start, Position goal, const AlgorithmOptions& options );
 }  // namespace pathfinding
