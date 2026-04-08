@@ -324,6 +324,8 @@ namespace pathfinding
 
 			const int start_heuristic = heuristic( start );
 			best_distance[ start_linear_index ] = 0;
+			// 起点的 g=0，f 仅由启发式决定。
+			// A* 会把 h(start) 放进 f，Dijkstra 则因为 h 恒为 0 而退化成纯 g 排序。
 			open_queue.push( { start_linear_index, 0, start_heuristic, start_heuristic } );
 
 			bool found_goal = false;
@@ -331,6 +333,9 @@ namespace pathfinding
 			{
 				const OpenNode current = open_queue.top();
 				open_queue.pop();
+				// 优先队列里可能存在陈旧条目：
+				// 某个格子先前以较差代价入队，后来又以更优代价重新入队。
+				// 这里一旦发现它已经 closed，就直接跳过。
 				if ( closed[ current.linear_index ] )
 				{
 					continue;
@@ -363,6 +368,7 @@ namespace pathfinding
 					const int candidate_distance = best_distance[ current.linear_index ] + 1;
 					if ( candidate_distance >= best_distance[ next_linear_index ] )
 					{
+						// 只有在找到更短的 g 值时，才更新 parent 并重新入队。
 						continue;
 					}
 
@@ -478,10 +484,10 @@ namespace pathfinding
 
 	// 运行标准四连通 BFS。
 	// 它既是一个独立的比较算法，也是其它启发式算法的最短路参考基线。
-	SearchResult RunBfs( const Grid& grid, Position start, Position goal )
-	{
-		SearchResult result = MakeEmptyResult( AlgorithmId::Bfs );
-		const auto	started_at = TimerClock::now();
+		SearchResult RunBfs( const Grid& grid, Position start, Position goal )
+		{
+			SearchResult result = MakeEmptyResult( AlgorithmId::Bfs );
+			const auto	started_at = TimerClock::now();
 		if ( !IsSearchRequestValid( grid, start, goal ) )
 		{
 			result.statistics.elapsed_microseconds = MeasureElapsedMicroseconds( started_at );
@@ -498,39 +504,41 @@ namespace pathfinding
 		std::vector<int> distance_by_index( total_cells, -1 );
 		std::vector<int> parent_by_index( total_cells, -1 );
 
-		distance_by_index[ start_linear_index ] = 0;
-		open_queue.push( start_linear_index );
+			distance_by_index[ start_linear_index ] = 0;
+			open_queue.push( start_linear_index );
 
-		bool found_goal = false;
-		while ( !open_queue.empty() )
-		{
-			const int current_linear_index = open_queue.front();
-			open_queue.pop();
-			result.statistics.expanded_node_count++;
-			if ( current_linear_index == goal_linear_index )
+			bool found_goal = false;
+			while ( !open_queue.empty() )
 			{
+				// BFS 始终按“先进先出”处理，天然保证第一次到达某点就是最短层数。
+				const int current_linear_index = open_queue.front();
+				open_queue.pop();
+				result.statistics.expanded_node_count++;
+				if ( current_linear_index == goal_linear_index )
+				{
 				found_goal = true;
 				break;
 			}
 
-			const Position current_position = FromLinearIndex( current_linear_index, grid_width );
-			for ( const Position& offset : kFourNeighborOffsets )
-			{
-				const int next_row = current_position.row + offset.row;
-				const int next_col = current_position.col + offset.col;
+				const Position current_position = FromLinearIndex( current_linear_index, grid_width );
+				for ( const Position& offset : kFourNeighborOffsets )
+				{
+					const int next_row = current_position.row + offset.row;
+					const int next_col = current_position.col + offset.col;
 				if ( !IsPassable( grid, next_row, next_col ) )
 				{
 					continue;
 				}
 
-				const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
-				if ( distance_by_index[ next_linear_index ] != -1 )
-				{
-					continue;
-				}
+					const int next_linear_index = ToLinearIndex( next_row, next_col, grid_width );
+					if ( distance_by_index[ next_linear_index ] != -1 )
+					{
+						// distance != -1 说明这个格子已经在更早或同层被访问过，不再重复入队。
+						continue;
+					}
 
-				distance_by_index[ next_linear_index ] = distance_by_index[ current_linear_index ] + 1;
-				parent_by_index[ next_linear_index ] = current_linear_index;
+					distance_by_index[ next_linear_index ] = distance_by_index[ current_linear_index ] + 1;
+					parent_by_index[ next_linear_index ] = current_linear_index;
 				open_queue.push( next_linear_index );
 			}
 		}
@@ -561,8 +569,8 @@ namespace pathfinding
 		} );
 	}
 
-	SearchResult RunBranchStar( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
-	{
+		SearchResult RunBranchStar( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
+		{
 		// 论文语义版 Branch Star：
 		// 1. 自由探索点优先沿主方向向目标推进
 		// 2. 首次撞障后，按“除当前前进方向外的其它方向”生成绕障分支
@@ -600,6 +608,9 @@ namespace pathfinding
 		discovered_node_indices.reserve( total_cells * 2 );
 
 		auto EncodeCrawlingStateIndex = [ & ]( int cell_linear_index, char travel_direction, char original_collision_direction ) {
+			// crawling 状态不能只按“所在格子”去重：
+			// 同一个格子上，若当前贴边方向不同，或最初被挡住的方向不同，
+			// 后续能否成功回归目标方向的行为也不同，因此要拆成更细的状态。
 			const int travel_direction_index = DirectionToIndex( travel_direction );
 			const int original_direction_index = DirectionToIndex( original_collision_direction );
 			if ( travel_direction_index < 0 || travel_direction_index >= 4 || original_direction_index < 0 || original_direction_index >= 4 )
@@ -617,6 +628,11 @@ namespace pathfinding
 							   int parent_node_index,
 							   int collision_count,
 							   bool high_priority ) {
+			// PushNode 是论文语义版 B* 的统一入队入口：
+			// 1. 检查目标格是否可走
+			// 2. 检查这个状态是否比历史记录更优
+			// 3. 写入 nodes / best_collision
+			// 4. 按优先级放到 deque 头或尾
 			if ( !IsPassable( grid, next_row, next_col ) )
 			{
 				return false;
@@ -627,6 +643,7 @@ namespace pathfinding
 			{
 				if ( collision_count >= best_direct_collision[ next_linear_index ] )
 				{
+					// 对自由推进状态，只按“到这个格子的最小撞障代价”去重。
 					return false;
 				}
 			}
@@ -635,6 +652,7 @@ namespace pathfinding
 				const int crawling_state_index = EncodeCrawlingStateIndex( next_linear_index, next_travel_direction, original_collision_direction );
 				if ( crawling_state_index == -1 || collision_count >= best_crawling_collision[ crawling_state_index ] )
 				{
+					// 绕障状态要按“格子 + 当前绕障方向 + 原始被挡方向”联合去重。
 					return false;
 				}
 			}
@@ -652,10 +670,12 @@ namespace pathfinding
 
 			if ( high_priority )
 			{
+				// push_front 对应“0 代价或更希望优先处理”的推进。
 				frontier.push_front( node_index );
 			}
 			else
 			{
+				// push_back 对应“新增了一次撞障/转向代价”的候选。
 				frontier.push_back( node_index );
 			}
 			discovered_node_indices.push_back( node_index );
@@ -676,6 +696,8 @@ namespace pathfinding
 				const int current_node_index = frontier.front();
 				frontier.pop_front();
 				const PaperBranchNode current_node = nodes[ current_node_index ];
+				// frontier 里允许存在陈旧状态：
+				// 如果当前节点携带的 collision_count 已经不是这类状态的最优值，就直接跳过。
 				if ( current_node.mode == BranchMode::Direct )
 				{
 					if ( current_node.collision_count != best_direct_collision[ current_node.cell_linear_index ] )
@@ -719,6 +741,7 @@ namespace pathfinding
 				{
 					if ( PushNode( next_row, next_col, BranchMode::Direct, 0, 0, current_node_index, current_node.collision_count, true ) )
 					{
+						// 直行成功并且新状态被接受，就不再额外生成绕障分支。
 						continue;
 					}
 
@@ -740,6 +763,7 @@ namespace pathfinding
 							current_node.collision_count + 1,
 							false );
 					}
+					// 只要直行未能产出有效前沿，就把撞障后的左右绕障候选全部交给队列。
 					continue;
 				}
 
@@ -751,6 +775,7 @@ namespace pathfinding
 
 				if ( PushNode( original_row, original_col, BranchMode::Direct, 0, 0, current_node_index, current_node.collision_count, true ) )
 				{
+					// 一旦原先被挡住的方向恢复可走，就立刻退出 crawling，重新回到直行模式。
 					continue;
 				}
 
@@ -764,6 +789,7 @@ namespace pathfinding
 						 current_node.collision_count,
 						 true ) )
 				{
+					// 回不去原方向时，优先继续沿当前贴边方向推进。
 					continue;
 				}
 
@@ -781,6 +807,7 @@ namespace pathfinding
 						current_node.collision_count,
 						false ) )
 					{
+						// 当前贴边方向也走不通时，再退一步考虑朝原方向反向绕行。
 						continue;
 					}
 				}
@@ -821,6 +848,9 @@ namespace pathfinding
 				const int seed_node_index = discovered_node_indices[ emergency_cursor ];
 				const PaperBranchNode& seed_node = nodes[ seed_node_index ];
 				const Position seed_position = FromLinearIndex( seed_node.cell_linear_index, grid_width );
+				// emergency reinjection：
+				// 当前沿耗尽但又还没到终点时，从已发现节点重新播一批 Direct 状态。
+				// 这是一种工程化兜底，目的不是严格复现经典 B*，而是避免过早宣告失败。
 				for ( char direction_char : BuildAllDirections() )
 				{
 					const auto offset = DirectionDelta( direction_char );
@@ -860,8 +890,8 @@ namespace pathfinding
 		return result;
 	}
 
-	SearchResult RunBranchStarClassic( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
-	{
+		SearchResult RunBranchStarClassic( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
+		{
 		// 经典轻量版 Branch Star：
 		// 1. 直行阶段只尝试朝目标方向推进
 		// 2. 直行受阻时，生成左右两个贴边分支
@@ -889,6 +919,8 @@ namespace pathfinding
 		std::vector<int> best_climb_collision( total_cells * 4, kInfinityCollision );
 
 		auto PushDirectNode = [ & ]( int next_row, int next_col, int parent_node_index, int collision_count, bool high_priority ) {
+			// 轻量版把 Direct 状态和绕障状态拆成两个更简单的入队函数，
+			// 这样读起来更接近“经典 B* 的直行 / 贴边”两种角色。
 			if ( !IsPassable( grid, next_row, next_col ) )
 			{
 				return false;
@@ -958,6 +990,8 @@ namespace pathfinding
 			frontier.pop_front();
 
 			const ClassicBranchNode current_node = nodes[ current_node_index ];
+			// 轻量版同样允许旧状态残留在 frontier 中；
+			// 这里通过 best_direct_collision / best_climb_collision 过滤掉陈旧条目。
 			if ( current_node.mode == BranchMode::Direct )
 			{
 				if ( current_node.collision_count != best_direct_collision[ current_node.cell_linear_index ] )
@@ -996,6 +1030,7 @@ namespace pathfinding
 
 				if ( greedy_direction != 0 && PushDirectNode( next_row, next_col, current_node_index, current_node.collision_count, true ) )
 				{
+					// 轻量经典版遵循最朴素的规则：直行能走，就绝不额外开分支。
 					continue;
 				}
 
@@ -1023,6 +1058,7 @@ namespace pathfinding
 				const auto [ row_delta, col_delta ] = DirectionDelta( greedy_direction );
 				if ( PushDirectNode( current_position.row + row_delta, current_position.col + col_delta, current_node_index, current_node.collision_count, true ) )
 				{
+					// 绕障时一旦发现目标方向恢复可走，也立刻回归 Direct。
 					continue;
 				}
 			}
@@ -1072,8 +1108,8 @@ namespace pathfinding
 		return result;
 	}
 
-	SearchResult RunBranchStarLegacy( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
-	{
+		SearchResult RunBranchStarLegacy( const Grid& grid, Position start, Position goal, const BranchStarOptions& options )
+		{
 		// 这是保留下来的旧版 / 增强版 Branch Star。
 		// 它带有更重的状态建模、全局 reinjection 和更强的兜底行为，
 		// 便于和新的经典轻量版做对比。
@@ -1112,6 +1148,8 @@ namespace pathfinding
 		// 尝试把一个新的 Branch Star 状态压入前沿。
 		// 这里统一处理边界检查、状态去重、parent 记录，以及 0/1 代价的前后入队。
 		auto TryPushState = [ & ]( int next_row, int next_col, BranchMode next_mode, char next_direction, int parent_state_id, int next_collision, bool high_priority ) {
+			// Legacy 版把状态压成一个整数 state_id，再用数组保存最优碰撞代价。
+			// 好处是实现统一、兜底能力强；代价是状态空间更大，常数也更高。
 			if ( !IsPassable( grid, next_row, next_col ) )
 			{
 				return false;
@@ -1163,6 +1201,7 @@ namespace pathfinding
 
 				if ( greedy_direction != 0 && IsPassable( grid, greedy_row, greedy_col ) )
 				{
+					// Legacy 版仍然保留 B* 的核心精神：自由状态下优先朝目标方向推进。
 					TryPushState( greedy_row, greedy_col, BranchMode::Direct, 0, current_state_id, current_collision, true );
 					return;
 				}
@@ -1240,6 +1279,7 @@ namespace pathfinding
 			{
 				const auto [ current_state_id, popped_collision ] = frontier.front();
 				frontier.pop_front();
+				// deque 里同样可能有旧状态，这里通过 best_collision 做最后一道筛选。
 				if ( popped_collision != best_collision[ current_state_id ] )
 				{
 					continue;
@@ -1279,6 +1319,8 @@ namespace pathfinding
 				}
 
 				const Position base_position = FromLinearIndex( cell_linear_index, grid_width );
+				// Legacy 版的全局 reinjection 更重：
+				// 它会从所有已发现格子重新注入 Direct 状态，因此鲁棒性更强，但速度通常更慢。
 				for ( char direction_char : BuildAllDirections() )
 				{
 					const auto [ row_delta, col_delta ] = DirectionDelta( direction_char );
@@ -1333,10 +1375,12 @@ namespace pathfinding
 		IBP_BStarAlgorithm::SearchOutcome legacy_outcome;
 		if ( options.enable_maze_rescue )
 		{
+			// 增强入口：主算法失败或路径无效时，允许回退到 zigzag rescue。
 			legacy_outcome = IBP_BStarAlgorithm::RunIbpBStarZigzagEnhanced( grid, legacy_start, legacy_goal, options.wait_layers, legacy_options );
 		}
 		else
 		{
+			// 严格版入口：只运行 IBP-B* 核心，不启用独立的迷宫补救搜索。
 			legacy_outcome = IBP_BStarAlgorithm::RunIbpBStar( grid, legacy_start, legacy_goal, options.wait_layers, legacy_options );
 		}
 

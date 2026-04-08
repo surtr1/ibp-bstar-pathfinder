@@ -97,17 +97,164 @@ namespace IBP_BStarAlgorithm
 			std::uint8_t phase_index = 0;
 		};
 
-		// 判断当前点是否可视为“凹入口”：
-		// 如果贪心方向是水平，则检查上下是否都可通行；
-		// 如果贪心方向是垂直，则检查左右是否都可通行。
-		// 这对应论文里常见的 concave 预探索思想。
-		bool IsConcaveEntry( const Grid& grid, int base_row, int base_col, char greedy_direction )
+		// 在一个小窗口内做局部 BFS，估计某个候选方向附近的可展开空间。
+		// 这个分数不是全局可达性，只是用来比较“继续朝前”和“转向侧面”哪一边更像值得预探索的入口。
+		int LocalWindowReachableCount( const Grid& grid, int start_row, int start_col, int center_row, int center_col, int window_radius )
 		{
-			if ( greedy_direction == 'L' || greedy_direction == 'R' )
+			if ( !IsCellPassable( grid, start_row, start_col ) )
 			{
-				return IsCellPassable( grid, base_row - 1, base_col ) && IsCellPassable( grid, base_row + 1, base_col );
+				return 0;
 			}
-			return IsCellPassable( grid, base_row, base_col - 1 ) && IsCellPassable( grid, base_row, base_col + 1 );
+
+			const int window_size = window_radius * 2 + 1;
+			std::vector<std::uint8_t> visited( window_size * window_size, 0 );
+			std::deque<std::pair<int, int>> queue;
+			auto InWindow = [ & ]( int row, int col ) {
+				return std::abs( row - center_row ) <= window_radius && std::abs( col - center_col ) <= window_radius;
+			};
+			auto ToVisitedIndex = [ & ]( int row, int col ) {
+				return ( row - center_row + window_radius ) * window_size + ( col - center_col + window_radius );
+			};
+
+			queue.push_back( { start_row, start_col } );
+			visited[ ToVisitedIndex( start_row, start_col ) ] = 1;
+
+			int reachable_count = 0;
+			while ( !queue.empty() )
+			{
+				const auto [ current_row, current_col ] = queue.front();
+				queue.pop_front();
+				++reachable_count;
+
+				for ( const auto& [ row_offset, col_offset ] : kDirectionOffsets )
+				{
+					const int next_row = current_row + row_offset;
+					const int next_col = current_col + col_offset;
+					if ( !InWindow( next_row, next_col ) || !IsCellPassable( grid, next_row, next_col ) )
+					{
+						continue;
+					}
+
+					const int visited_index = ToVisitedIndex( next_row, next_col );
+					if ( visited[ visited_index ] != 0 )
+					{
+						continue;
+					}
+
+					visited[ visited_index ] = 1;
+					queue.push_back( { next_row, next_col } );
+				}
+			}
+			return reachable_count;
+		}
+
+		// 先用常数级局部形状做一轮粗筛，避免在普通开阔区里频繁跑窗口 BFS。
+		// 只有当“当前点较受约束，且下一格横向空间变多或正前方开始受限”时，才值得进入更重的局部可达性估计。
+		bool ShouldProbeConcaveLocally( const Grid& grid, int current_row, int current_col, int next_row, int next_col, char greedy_direction )
+		{
+			if ( greedy_direction == 0 )
+			{
+				return false;
+			}
+
+			const auto [ left_dir_char, right_dir_char ] = LeftRightDirections( greedy_direction );
+			const auto left_offset = DirectionDelta( left_dir_char );
+			const auto right_offset = DirectionDelta( right_dir_char );
+			const auto forward_offset = DirectionDelta( greedy_direction );
+
+			const bool current_left_open = IsCellPassable( grid, current_row + left_offset.first, current_col + left_offset.second );
+			const bool current_right_open = IsCellPassable( grid, current_row + right_offset.first, current_col + right_offset.second );
+			const bool next_left_open = IsCellPassable( grid, next_row + left_offset.first, next_col + left_offset.second );
+			const bool next_right_open = IsCellPassable( grid, next_row + right_offset.first, next_col + right_offset.second );
+			const bool forward_open = IsCellPassable( grid, next_row + forward_offset.first, next_col + forward_offset.second );
+
+			const int current_side_open_count = ( current_left_open ? 1 : 0 ) + ( current_right_open ? 1 : 0 );
+			const int next_side_open_count = ( next_left_open ? 1 : 0 ) + ( next_right_open ? 1 : 0 );
+
+			// 当前点至少要有一点“贴着障碍走”的受约束感，否则大多数普通开阔区都没必要做预探索。
+			const bool current_is_constrained = current_side_open_count < 2;
+			// 下一格横向必须有可展开空间，否则即使跑 BFS 也只会得到一个狭窄直通道。
+			const bool next_has_side_space = next_side_open_count > 0;
+			// 下一格比当前点更“张开”，说明这里更像一个入口或侧向口袋。
+			const bool lateral_space_increases = next_side_open_count > current_side_open_count;
+			// 如果正前方已经开始受限，也值得进一步确认这里是不是侧向岔口。
+			const bool forward_becomes_constrained = !forward_open;
+
+			return current_is_constrained && next_has_side_space && ( lateral_space_increases || forward_becomes_constrained );
+		}
+
+		// 用“粗筛 + 局部窗口 BFS”替代原来的“单格凹口”规则。
+		// 只有当粗筛认为这里像入口样式时，才进一步比较前方与侧向的局部可展开空间。
+		bool IsConcaveEntry( const Grid& grid, int current_row, int current_col, int next_row, int next_col, char greedy_direction )
+		{
+			if ( !ShouldProbeConcaveLocally( grid, current_row, current_col, next_row, next_col, greedy_direction ) )
+			{
+				return false;
+			}
+
+			const auto [ left_dir_char, right_dir_char ] = LeftRightDirections( greedy_direction );
+			const auto left_offset = DirectionDelta( left_dir_char );
+			const auto right_offset = DirectionDelta( right_dir_char );
+			const auto forward_offset = DirectionDelta( greedy_direction );
+
+			const int window_radius = 3;
+			const int left_row = next_row + left_offset.first;
+			const int left_col = next_col + left_offset.second;
+			const int right_row = next_row + right_offset.first;
+			const int right_col = next_col + right_offset.second;
+			const int forward_row = next_row + forward_offset.first;
+			const int forward_col = next_col + forward_offset.second;
+
+			const int left_area = LocalWindowReachableCount( grid, left_row, left_col, next_row, next_col, window_radius );
+			const int right_area = LocalWindowReachableCount( grid, right_row, right_col, next_row, next_col, window_radius );
+			const int forward_area = LocalWindowReachableCount( grid, forward_row, forward_col, next_row, next_col, window_radius );
+			const int side_area = std::max( left_area, right_area );
+
+			return side_area >= 4 && side_area >= forward_area + 2;
+		}
+
+		// 预测前方几步是否会迅速收窄成窄道。
+		// 这里只替换 rebirth 的触发判定，不改 rebirth 触发后的行为。
+		bool HasNarrowPassageRisk( const Grid& grid, int row, int col, char direction_char )
+		{
+			if ( direction_char == 0 || !IsCellPassable( grid, row, col ) )
+			{
+				return false;
+			}
+
+			const auto [ left_dir_char, right_dir_char ] = LeftRightDirections( direction_char );
+			const auto left_offset = DirectionDelta( left_dir_char );
+			const auto right_offset = DirectionDelta( right_dir_char );
+			const auto forward_offset = DirectionDelta( direction_char );
+
+			int corridor_like_steps = 0;
+			int sealed_steps = 0;
+			int current_row = row;
+			int current_col = col;
+			for ( int step = 0; step < 3; ++step )
+			{
+				if ( !IsCellPassable( grid, current_row, current_col ) )
+				{
+					break;
+				}
+
+				const bool left_open = IsCellPassable( grid, current_row + left_offset.first, current_col + left_offset.second );
+				const bool right_open = IsCellPassable( grid, current_row + right_offset.first, current_col + right_offset.second );
+				if ( !left_open || !right_open )
+				{
+					++corridor_like_steps;
+				}
+				if ( !left_open && !right_open )
+				{
+					++sealed_steps;
+				}
+
+				current_row += forward_offset.first;
+				current_col += forward_offset.second;
+			}
+
+			const bool forward_escape_is_limited = !IsCellPassable( grid, current_row, current_col );
+			return corridor_like_steps >= 2 && ( sealed_steps >= 1 || forward_escape_is_limited );
 		}
 
 		std::array<char, 4> BuildZigzagStateDirectionPriority( char last_direction, ZigzagTurnBias turn_bias, ZigzagPhase phase,
@@ -408,15 +555,6 @@ namespace IBP_BStarAlgorithm
 			return depth_array[ queue.front() ] <= ( meet_depth + wait_layers );
 		};
 
-		auto FlanksBlockedAt = [ & ]( int row, int col, char direction_char ) {
-			// 判断某个前进方向两侧是否同时被堵住。
-			// 若成立，说明当前推进可能进入了一条“夹缝”或狭道，可触发 rebirth 逻辑。
-			auto [ left_dir_char, right_dir_char ] = LeftRightDirections( direction_char );
-			const auto left_offset = DirectionDelta( left_dir_char );
-			const auto right_offset = DirectionDelta( right_dir_char );
-			return IsCellBlocked( grid, row + left_offset.first, col + left_offset.second ) && IsCellBlocked( grid, row + right_offset.first, col + right_offset.second );
-		};
-
 		auto TryVisit = [ & ]( int next_row, int next_col, int parent_index, int next_depth, const ObstacleState& next_state,
 							   DepthArray& this_depth, ParentArray& this_parent, std::vector<ObstacleState>& this_state,
 							   NodeQueue& this_queue, DepthArray& opposite_depth ) {
@@ -464,8 +602,9 @@ namespace IBP_BStarAlgorithm
 				if ( IsCellPassable( grid, next_row, next_col ) )
 				{
 					// 正常贪心前进一步。
-					// 如果新位置两侧都被堵住，则把当前点重新压回队列，给它一次“重生式”再扩展机会。
-					if ( !current_state.rebirth_used && FlanksBlockedAt( next_row, next_col, movement_direction ) )
+					// 如果局部预测显示前方几步会迅速收窄成窄道，则把当前点重新压回队列，
+					// 给它一次“重生式”再扩展机会。
+					if ( !current_state.rebirth_used && HasNarrowPassageRisk( grid, next_row, next_col, movement_direction ) )
 					{
 						this_state[ current_linear_index ].rebirth_used = true;
 						this_queue.push_back( current_linear_index );
@@ -474,7 +613,7 @@ namespace IBP_BStarAlgorithm
 					ObstacleState reset_state;
 					TryVisit( next_row, next_col, current_linear_index, next_depth_value, reset_state, this_depth, this_parent, this_state, this_queue, opposite_depth );
 
-					if ( IsConcaveEntry( grid, next_row, next_col, movement_direction ) )
+					if ( IsConcaveEntry( grid, current_row, current_col, next_row, next_col, movement_direction ) )
 					{
 						// 凹入口预探索：
 						// 一旦判断前方像一个凹口，就把侧向候选也提前加入搜索。

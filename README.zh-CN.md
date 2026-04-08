@@ -26,7 +26,7 @@
 项目里把三种 B* 变体明确区分开：
 
 - `B* PaperCrawl`
-  - 当前默认的 Zhao 风格 / 论文语义版
+  - 当前默认的 论文语义版
   - 入口：`RunBranchStar(...)`
 - `B* GreedyLite`
   - 更轻量的经典贪心分支绕障版
